@@ -1,0 +1,31 @@
+# Git
+.git/
+*.pyc
+__pycache__/
+*.pyo
+.pytest_cache/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 媒体文件（太大，不打包）
+media/image/*
+media/video/*
+media/file/*
+!media/image/.gitkeep
+!media/video/.gitkeep
+!media/file/.gitkeep
+
+# 会话文件（敏感）
+telegram.session
+
+# 临时文件
+*.log
+test_*.py
+check_data.py

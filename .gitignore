@@ -1,58 +1,40 @@
-# Environment variables
+# 环境变量（含 API 密钥）
 .env
+
+# Telegram 会话（敏感）
+telegram.session
+telegram.session-journal
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+*.pyc
+*.pyo
 *.egg-info/
-.installed.cfg
+dist/
+build/
 *.egg
 
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# Logs
+# 媒体文件（太大）
+media/
+
+# 日志
 *.log
-bot.log
 
-# OS
+# 系统
 .DS_Store
 Thumbs.db
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Database
-*.db
-*.sqlite3
+# 临时测试文件
+test_*.py
+check_*.py
+scan_*.py
+verify_*.py
+collect_*.py
+gen_*.py
+quick_*.py

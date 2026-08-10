@@ -1,25 +1,36 @@
 """
-Scheduler for automated tasks: daily reports and database cleanup.
+调度器：每日精华总结 + 数据库清理。
 """
 import logging
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime
+
+from collector import TelegramCollector
 from db import Database
-from bot import TelegramAnalyticsBot
+from gemini_service import GeminiService
+from utils import chunk_text
+from main import _sync_today_comments
 
 logger = logging.getLogger(__name__)
 
 
 class BotScheduler:
-    def __init__(self, bot: TelegramAnalyticsBot, database: Database, target_chat_id: int = None):
+    def __init__(
+        self,
+        collector: TelegramCollector,
+        database: Database,
+        gemini: GeminiService,
+        summary_chat_id,
+    ):
         self.scheduler = AsyncIOScheduler()
-        self.bot = bot
+        self.collector = collector
         self.db = database
-        self.target_chat_id = target_chat_id
+        self.gemini = gemini
+        self.summary_chat_id = summary_chat_id
 
     async def cleanup_task(self):
-        """Scheduled task to clean up old messages."""
+        """定时清理 14 天前的旧消息。"""
         logger.info("⏰ Running scheduled cleanup task...")
         try:
             deleted_count = await self.db.cleanup_old_messages()
@@ -27,32 +38,69 @@ class BotScheduler:
         except Exception as e:
             logger.error(f"❌ Cleanup task failed: {e}")
 
-    async def daily_report_task(self):
-        """Scheduled task to send daily analytics report."""
-        logger.info("⏰ Running scheduled daily report task...")
-        
-        if not self.target_chat_id:
-            logger.warning("No target chat ID configured for daily reports")
-            return
-        
+    async def daily_summary_task(self):
+        """生成并发送今日老师分析与评分报告。"""
+        logger.info("⏰ Running scheduled daily teacher report task...")
         try:
-            await self.bot.send_daily_report(self.target_chat_id)
-        except Exception as e:
-            logger.error(f"❌ Daily report task failed: {e}")
+            # 1. 先补采，防止离线期间漏消息
+            await self.collector.sync_recent(limit=500)
 
-    def start(self):
-        """Start the scheduler with configured jobs."""
-        # Daily report at 23:59
+            # 1.5 补采今日帖子的评论
+            await _sync_today_comments(self.collector, self.db)
+
+            # 2. 汇总今日所有目标来源的帖子+评论
+            today = datetime.now().date()
+            all_posts_with_comments = []
+            for chat_id in list(self.collector.watched_chat_ids):
+                items = await self.db.get_posts_with_comments(chat_id, today)
+                all_posts_with_comments.extend(items)
+
+            if not all_posts_with_comments:
+                logger.info("No posts today, sending empty digest")
+                await self.collector.send_message(
+                    self.summary_chat_id,
+                    f"📝 每日老师分析 ({today})\n\n今日暂无新帖子。"
+                )
+                return
+
+            total_comments = sum(len(item["comments"]) for item in all_posts_with_comments)
+            logger.info(f"Generating teacher report for {len(all_posts_with_comments)} teachers, {total_comments} comments")
+
+            # 3. 调用 Gemini 生成老师分析报告
+            source_names = ", ".join(self.collector.source_names)
+            summary = await self.gemini.generate_teacher_report(
+                all_posts_with_comments,
+                date_str=str(today),
+                source_names=source_names,
+            )
+
+            # 4. 分块发送
+            chunks = chunk_text(summary)
+            for i, chunk in enumerate(chunks):
+                text = f"📝 每日老师分析 ({today})\n\n{chunk}" if i == 0 else chunk
+                await self.collector.send_message(self.summary_chat_id, text)
+
+            logger.info("✅ Daily teacher report sent")
+        except Exception as e:
+            logger.error(f"❌ Daily digest task failed: {e}")
+
+    def start(self, report_time: str = "23:59"):
+        """启动调度器。report_time 按服务器本地时区。"""
+        try:
+            hour, minute = map(int, report_time.split(":"))
+        except ValueError:
+            logger.warning(f"Invalid REPORT_TIME '{report_time}', defaulting to 23:59")
+            hour, minute = 23, 59
+
         self.scheduler.add_job(
-            self.daily_report_task,
-            CronTrigger(hour=23, minute=59),
-            id='daily_report',
-            name='Daily Analytics Report',
+            self.daily_summary_task,
+            CronTrigger(hour=hour, minute=minute),
+            id='daily_summary',
+            name='Daily Digest',
             replace_existing=True
         )
-        logger.info("📅 Scheduled: Daily report at 23:59")
-        
-        # Daily cleanup at 00:30 (30 minutes after midnight)
+        logger.info(f"📅 Scheduled: Daily digest at {hour:02d}:{minute:02d} (server local time)")
+
         self.scheduler.add_job(
             self.cleanup_task,
             CronTrigger(hour=0, minute=30),
@@ -61,18 +109,11 @@ class BotScheduler:
             replace_existing=True
         )
         logger.info("📅 Scheduled: Database cleanup at 00:30")
-        
-        # Start the scheduler
+
         self.scheduler.start()
         logger.info("✅ Scheduler started successfully")
 
     def stop(self):
-        """Stop the scheduler."""
         if self.scheduler.running:
             self.scheduler.shutdown()
             logger.info("Scheduler stopped")
-
-    def set_target_chat(self, chat_id: int):
-        """Set the target chat ID for daily reports."""
-        self.target_chat_id = chat_id
-        logger.info(f"Target chat ID set to: {chat_id}")

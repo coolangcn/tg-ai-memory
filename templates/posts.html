@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2 class="mb-4">📋 帖子列表</h2>
+
+{% if posts %}
+<div class="row g-4">
+    {% for post in posts %}
+    <div class="col-md-6 col-lg-4">
+        <div class="card post-card h-100">
+            <!-- 媒体预览 -->
+            {% if post.media and post.media[0] and post.media[0].file_type %}
+            <div class="post-media">
+                {% for m in post.media[:1] %}
+                    {% if m.file_type == 'image' %}
+                    <a href="https://t.me/{{ channel }}/{{ post.message_id }}" target="_blank">
+                        <img src="https://t.me/{{ channel }}/{{ post.message_id }}" alt="图片" loading="lazy"
+                             onerror="this.style.display='none'">
+                    </a>
+                    {% elif m.file_type == 'video' %}
+                    <a href="https://t.me/{{ channel }}/{{ post.message_id }}" target="_blank" class="btn btn-sm btn-outline-primary">🎬 查看视频</a>
+                    {% endif %}
+                {% endfor %}
+            </div>
+            {% endif %}
+
+            <div class="card-body">
+                <p class="card-text">{{ (post.message_text or '')[:150] }}{% if (post.message_text or '')|length > 150 %}...{% endif %}</p>
+                <div class="d-flex justify-content-between align-items-center">
+                    <small class="text-muted">{{ post.created_at.strftime('%m-%d %H:%M') if post.created_at else '' }}</small>
+                    <span class="badge bg-secondary">{{ post.comment_count or 0 }} 评论</span>
+                </div>
+                <a href="/post/{{ post.id }}" class="btn btn-sm btn-outline-primary mt-2">查看详情</a>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- 分页 -->
+<nav class="mt-4">
+    <ul class="pagination justify-content-center">
+        {% if page > 1 %}
+        <li class="page-item"><a class="page-link" href="/posts?page={{ page - 1 }}&limit={{ limit }}">上一页</a></li>
+        {% endif %}
+        <li class="page-item active"><span class="page-link">{{ page }}</span></li>
+        {% if posts|length >= limit %}
+        <li class="page-item"><a class="page-link" href="/posts?page={{ page + 1 }}&limit={{ limit }}">下一页</a></li>
+        {% endif %}
+    </ul>
+</nav>
+{% else %}
+<div class="alert alert-info">暂无帖子数据</div>
+{% endif %}
+{% endblock %}

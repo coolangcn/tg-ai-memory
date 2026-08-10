@@ -1,0 +1,56 @@
+# Telegram 频道分析平台 - Docker Compose (NAS 部署)
+# 使用方法: docker-compose up -d
+version: '3.8'
+
+services:
+  tg-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg-analyzer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据库（使用 NAS 上已有的 PostgreSQL）
+      - DATABASE_URL=postgresql://postgres:cncncncn@10.88.0.3:5433/tg_bot
+      # Telegram 账号
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+      - TELEGRAM_PASSWORD=${TELEGRAM_PASSWORD}
+      - TELEGRAM_PROXY=${TELEGRAM_PROXY:-}
+      # 大模型
+      - OPENAI_BASE_URL=https://api.moco.fun/v1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=gemini-3.5-flash-lite
+      # 采集配置
+      - WATCH_CHANNELS=@SZnewls
+      - SUMMARY_CHAT_ID=me
+      - REPORT_TIME=23:59
+      - CHANNEL_USERNAME=SZnewls
+      - MEDIA_DIR=/app/media
+      - PORT=8000
+    volumes:
+      # 媒体文件存储（图片/视频引用）
+      - ./media:/app/media
+      # Telegram 会话（避免重复登录）
+      - ./telegram.session:/app/telegram.session
+      # Web 模板（方便修改）
+      - ./templates:/app/templates
+    networks:
+      - tg-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  tg-network:
+    driver: bridge

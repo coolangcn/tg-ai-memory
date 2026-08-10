@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2 class="mb-4">📊 数据概览</h2>
+
+<div class="row g-4 mb-4">
+    <div class="col-md-3">
+        <div class="stat-card bg-primary">
+            <h3>{{ stats.total_posts or 0 }}</h3>
+            <p class="mb-0">总帖子数</p>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card bg-success">
+            <h3>{{ stats.total_comments or 0 }}</h3>
+            <p class="mb-0">总评论数</p>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card bg-warning">
+            <h3>{{ stats.total_media or 0 }}</h3>
+            <p class="mb-0">媒体文件</p>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card bg-info">
+            <h3>{{ stats.posts_with_comments or 0 }}</h3>
+            <p class="mb-0">有评论帖子</p>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title">数据时间范围</h5>
+        <p class="card-text">
+            最早: {{ stats.earliest[:10] if stats.earliest else 'N/A' }} 至 
+            最新: {{ stats.latest[:10] if stats.latest else 'N/A' }}
+        </p>
+        <a href="/posts" class="btn btn-primary">查看帖子</a>
+        <a href="/report" class="btn btn-success">生成报告</a>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8">
+        <!-- 帖子内容 -->
+        <div class="card mb-4">
+            <div class="card-body">
+                <h5 class="card-title">帖子详情</h5>
+                <p class="text-muted">
+                    {{ post.created_at.strftime('%Y-%m-%d %H:%M') if post.created_at else '' }}
+                    {% if post.chat_title %} | {{ post.chat_title }}{% endif %}
+                </p>
+
+                <!-- 媒体文件 -->
+                {% if media %}
+                <div class="mb-3">
+                    <p class="text-muted">📎 媒体文件 ({{ media|length }}个) - 
+                        <a href="https://t.me/{{ channel_username }}/{{ post.message_id }}" target="_blank">在 Telegram 查看</a>
+                    </p>
+                    {% for m in media %}
+                        {% if m.file_type == 'image' %}
+                        <a href="https://t.me/{{ channel_username }}/{{ post.message_id }}" target="_blank">
+                            <img src="https://t.me/{{ channel_username }}/{{ post.message_id }}" class="img-fluid rounded mb-2" style="max-height:400px;"
+                                 onerror="this.style.display='none'">
+                        </a>
+                        {% elif m.file_type == 'video' %}
+                        <a href="https://t.me/{{ channel_username }}/{{ post.message_id }}" target="_blank" class="btn btn-outline-primary">🎬 查看视频</a>
+                        {% endif %}
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                <div class="post-text" style="white-space: pre-wrap;">{{ post.message_text or '' }}</div>
+
+                {% if post_link %}
+                <a href="{{ post_link }}" target="_blank" class="btn btn-sm btn-outline-info mt-2">在 Telegram 查看原文</a>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- 评论列表 -->
+        <div class="card">
+            <div class="card-body">
+                <h5>💬 评论 ({{ comments|length }})</h5>
+                {% if comments %}
+                    {% for c in comments %}
+                    <div class="comment-bubble">
+                        <small class="text-muted">{{ c.created_at.strftime('%m-%d %H:%M') if c.created_at else '' }}</small>
+                        <p class="mb-0" style="white-space: pre-wrap;">{{ c.message_text or '' }}</p>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <p class="text-muted">暂无评论</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5>操作</h5>
+                <a href="/posts" class="btn btn-secondary w-100 mb-2">返回列表</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
