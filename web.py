@@ -22,6 +22,8 @@ load_dotenv()
 
 app = FastAPI(title="Telegram 频道分析")
 templates = Jinja2Templates(directory="templates")
+# 清空 globals 避免 Jinja2 3.1.6 缓存键包含不可哈希的 dict 值
+templates.env.globals = {}
 
 # 全局状态
 db: Optional[Database] = None
