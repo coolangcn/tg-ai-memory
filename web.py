@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from jinja2 import Environment, FileSystemLoader
 
 # 添加项目根目录到 path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -21,14 +21,19 @@ from gemini_service import GeminiService
 load_dotenv()
 
 app = FastAPI(title="Telegram 频道分析")
-templates = Jinja2Templates(directory="templates")
-# 清空 globals 避免 Jinja2 3.1.6 缓存键包含不可哈希的 dict 值
-templates.env.globals = {}
+# 使用 Jinja2 原生 API 避免 Starlette Jinja2Templates 的崩溃
+env = Environment(loader=FileSystemLoader("templates"), autoescape=True, enable_async=True)
 
 # 全局状态
 db: Optional[Database] = None
 collector: Optional[TelegramCollector] = None
 gemini: Optional[GeminiService] = None
+
+
+async def render_template(template_name: str, **context) -> str:
+    """渲染模板并返回 HTML 字符串。"""
+    template = env.get_template(template_name)
+    return await template.render_async(**context)
 
 
 @app.on_event("startup")
@@ -63,10 +68,8 @@ async def shutdown():
 async def index(request: Request):
     """首页 - 统计概览。"""
     stats = await get_stats()
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "stats": stats,
-    })
+    html = await render_template("index.html", stats=stats)
+    return HTMLResponse(html)
 
 
 @app.get("/posts", response_class=HTMLResponse)
@@ -84,14 +87,14 @@ async def posts_page(request: Request, page: int = 1, limit: int = 20):
 
     channel_username = os.getenv("CHANNEL_USERNAME", "SZnewls")
 
-    return templates.TemplateResponse("posts.html", {
-        "request": request,
-        "posts": all_posts,
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "channel": channel_username,
-    })
+    html = await render_template("posts.html",
+        posts=all_posts,
+        page=page,
+        limit=limit,
+        total=total,
+        channel=channel_username,
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/post/{post_id}", response_class=HTMLResponse)
@@ -110,23 +113,21 @@ async def post_detail(request: Request, post_id: int):
     channel_username = os.getenv("CHANNEL_USERNAME", "SZnewls")
     post_link = f"https://t.me/{channel_username}/{post['message_id']}" if post['message_id'] else None
 
-    return templates.TemplateResponse("post_detail.html", {
-        "request": request,
-        "post": dict(post),
-        "comments": [dict(c) for c in comments],
-        "media": [dict(m) for m in media],
-        "post_link": post_link,
-        "channel_username": channel_username,
-    })
+    html = await render_template("post_detail.html",
+        post=dict(post),
+        comments=[dict(c) for c in comments],
+        media=[dict(m) for m in media],
+        post_link=post_link,
+        channel_username=channel_username,
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/report", response_class=HTMLResponse)
 async def report_page(request: Request):
     """报告生成页面。"""
-    return templates.TemplateResponse("report.html", {
-        "request": request,
-        "report": None,
-    })
+    html = await render_template("report.html", report=None)
+    return HTMLResponse(html)
 
 
 @app.post("/api/report")
