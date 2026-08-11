@@ -1,16 +1,16 @@
-# NAS 部署快速指南
+# NAS 部署快速指南（纯定时报告版）
 
 ## 前置条件
 - NAS 已安装 Docker + Docker Compose（群晖/威联通等均支持）
-- PostgreSQL 已运行（10.88.0.3:5433，数据库 tg_bot 已创建）
+- PostgreSQL 已运行（127.0.0.1:5433，数据库 tg_bot 已创建）
 
 ## 部署步骤
 
 ### 1. 在 NAS 上创建项目目录
 
 ```bash
-mkdir -p /volume1/docker/tg-analyzer
-cd /volume1/docker/tg-analyzer
+mkdir -p /vol1/1000/docker/tg-analyzer
+cd /vol1/1000/docker/tg-analyzer
 ```
 
 ### 2. 上传项目文件
@@ -20,7 +20,6 @@ cd /volume1/docker/tg-analyzer
 - `docker-compose.yml`
 - `requirements.txt`
 - `*.py`（所有 Python 文件）
-- `templates/`（模板目录）
 - `.env`（环境变量文件，含 API 密钥）
 - `telegram.session`（已登录的会话文件）
 
@@ -30,18 +29,11 @@ cd /volume1/docker/tg-analyzer
 docker-compose up -d
 ```
 
-### 4. 访问 Web 界面
+### 4. 查看日志确认运行
 
-浏览器打开：`http://10.88.0.3:8000`
-
-## 功能说明
-
-| 页面 | 功能 |
-|------|------|
-| `/` | 数据概览统计 |
-| `/posts` | 帖子列表（含图片/视频预览） |
-| `/post/{id}` | 帖子详情（完整媒体 + 评论） |
-| `/report` | 生成高分老师精华报告 |
+```bash
+docker-compose logs -f tg-analyzer
+```
 
 ## 定时任务（自动运行）
 
@@ -49,11 +41,19 @@ docker-compose up -d
 
 | 时间 | 任务 |
 |------|------|
-| 09:00 | 高分老师榜单报告（评分>9 且评价≥10 条，TOP20 图文并茂发送到收藏夹） |
+| 09:00 | 高分老师榜单报告（评分≥9.18 且评价≥10 条，TOP20 图文并茂发送到收藏夹） |
 | REPORT_TIME（默认 23:59） | 每日精华总结 |
 | 00:30 | 数据库清理（删除 14 天前旧消息） |
 
-如需调整榜单发送时间，修改 `docker-compose.yml` 中 `scheduler.py` 里的 CronTrigger（`hour=9, minute=0`）或改为环境变量控制。
+如需调整榜单发送时间，修改 `scheduler.py` 中的 CronTrigger（`hour=9, minute=0`）。
+
+## 首次部署：全量采集历史报告
+
+数据库为空时，先运行一次全量采集（约 10-15 分钟）：
+
+```bash
+docker-compose run --rm tg-analyzer python collect_reports.py
+```
 
 ## 日常运维
 
@@ -88,11 +88,11 @@ docker-compose run --rm tg-analyzer python login.py
 
 ## 常见问题
 
-**Q: 服务启动后无法访问？**
-A: 检查防火墙是否放行 8000 端口，或尝试 `docker-compose logs` 查看错误。
-
 **Q: Telegram session 失效？**
 A: 运行 `docker-compose run --rm tg-analyzer python login.py` 重新登录。
 
 **Q: 数据库连接失败？**
 A: 确认 PostgreSQL 已启动，且 DATABASE_URL 配置正确。
+
+**Q: 需要手动触发一次榜单报告？**
+A: 运行 `docker-compose run --rm tg-analyzer python send_report.py`。

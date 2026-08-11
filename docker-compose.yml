@@ -1,4 +1,4 @@
-# Telegram 频道分析平台 - Docker Compose (NAS 部署)
+# Telegram 频道分析平台 - Docker Compose (NAS 部署，纯定时报告)
 # 使用方法: docker compose up -d
 
 services:
@@ -8,7 +8,7 @@ services:
       dockerfile: Dockerfile
     container_name: tg-analyzer
     restart: unless-stopped
-    # 使用宿主机网络：直连 NAS 本机 PostgreSQL(127.0.0.1:5433)，Web 直接监听 8000
+    # 使用宿主机网络：直连 NAS 本机 PostgreSQL(127.0.0.1:5433)
     network_mode: host
     environment:
       # 数据库（NAS 上已有的 PostgreSQL，host 网络下用 127.0.0.1）
@@ -28,23 +28,14 @@ services:
       - WATCH_CHANNELS=@SZnewls
       - SUMMARY_CHAT_ID=me
       - REPORT_TIME=23:59
-      - CHANNEL_USERNAME=SZnewls
       - MEDIA_DIR=/app/media
-      - PORT=8000
     volumes:
       # 媒体文件存储（图片/视频引用）
       - ./media:/app/media
       # Telegram 会话（避免重复登录）
       - ./telegram.session:/app/telegram.session
-      # Web 模板（方便修改）
-      - ./templates:/app/templates
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
-      interval: 30s
-      timeout: 10s
-      retries: 3

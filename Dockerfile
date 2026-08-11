@@ -1,4 +1,4 @@
-# Telegram 频道分析平台 - Dockerfile
+# Telegram 频道分析平台 - Dockerfile（纯定时报告，无 Web 页面）
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制项目文件
 COPY *.py .
-COPY templates/ templates/
 
 # 创建媒体目录
 RUN mkdir -p media/image media/video media/file
@@ -23,8 +22,5 @@ RUN mkdir -p media/image media/video media/file
 ENV PYTHONUNBUFFERED=1
 ENV MEDIA_DIR=/app/media
 
-# 暴露端口
-EXPOSE 8000
-
-# 启动命令
-CMD ["python", "-m", "uvicorn", "web:app", "--host", "0.0.0.0", "--port", "8000"]
+# 启动命令：采集器 + 定时报告
+CMD ["python", "main.py"]

@@ -1,14 +1,12 @@
 """
 Main entry point for Telegram Channel Analyzer.
-Telethon (user account) collector + PostgreSQL + Gemini + FastAPI Web UI.
+Telethon (user account) collector + PostgreSQL + Gemini + 定时报告（无 Web 页面）。
 """
 import asyncio
 import os
 import sys
 import logging
-from datetime import datetime, timezone
 
-import uvicorn
 from dotenv import load_dotenv
 
 from db import Database
@@ -16,20 +14,12 @@ from gemini_service import GeminiService
 from collector import TelegramCollector
 from scheduler import BotScheduler
 from utils import setup_logging, sync_today_comments
-from web import app as web_app, startup as web_startup, shutdown as web_shutdown
 
 logger = logging.getLogger(__name__)
-
-# Global state
-collector = None
-db = None
-gemini = None
 
 
 async def run_collector():
     """后台运行采集器和调度器。"""
-    global collector, db, gemini
-
     # 校验环境变量
     api_id = os.getenv("TELEGRAM_API_ID")
     api_hash = os.getenv("TELEGRAM_API_HASH")
@@ -60,24 +50,17 @@ async def run_collector():
     logger.info("🤖 Initializing Gemini AI service...")
     gemini = GeminiService(gemini_api_key)
 
-    # 设置 web app 的全局 db/collector/gemini
-    import web
-    web.db = db
-    web.collector = None  # Will be set after collector starts
-    web.gemini = gemini
-
     # Telethon 采集器
     logger.info("🤖 Initializing Telethon collector...")
     collector = TelegramCollector(int(api_id), api_hash, phone, db, watch.split(","))
     await collector.start()
-    web.collector = collector
 
     # 启动时补采
     logger.info("🔄 Syncing recent posts...")
     await collector.sync_recent(limit=500)
     await sync_today_comments(collector, db)
 
-    # 调度器
+    # 调度器（高分榜单 09:00 + 每日精华 23:59 + 清理 00:30）
     logger.info(f"⏰ Daily teacher report at {report_time}")
     scheduler = BotScheduler(collector, db, gemini, summary_chat_id)
     scheduler.start(report_time=report_time)
@@ -90,7 +73,6 @@ async def run_collector():
 
 
 async def main():
-    """启动 FastAPI Web + 后台采集器。"""
     load_dotenv()
     setup_logging()
 
@@ -98,18 +80,8 @@ async def main():
     logger.info("🚀 Telegram Channel Analyzer Starting...")
     logger.info("=" * 60)
 
-    # 启动后台采集器
-    asyncio.create_task(run_collector())
-
-    # 启动 FastAPI
-    config = uvicorn.Config(
-        web_app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        log_level="info",
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
+    # 启动后台采集器 + 定时任务（无 Web 页面）
+    await run_collector()
 
 
 if __name__ == "__main__":
