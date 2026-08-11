@@ -38,3 +38,6 @@ verify_*.py
 collect_*.py
 gen_*.py
 quick_*.py
+
+# 保留：全量报告采集脚本（NAS 首次部署需要）
+!collect_reports.py
