@@ -1,5 +1,5 @@
 """高分老师榜单报告 - 图文并茂版。
-过滤条件：综合评分 > 9 且 有效评价(报告) >= 10 条。
+过滤条件：综合评分 >= 9.18 且 有效评价(报告) >= 10 条。
 按评分排序取前 20 名，附图片、标签、评论总结、原帖链接。
 """
 import asyncio
@@ -14,7 +14,7 @@ from collector import TelegramCollector
 load_dotenv()
 
 CHANNEL_ID = -1002460327295
-MIN_SCORE = 9.0
+MIN_SCORE = 9.18
 MIN_COMMENTS = 10
 TOP_N = 20
 MAX_COMMENTS_PER_TEACHER = 12  # 上下文采样上限
@@ -103,7 +103,7 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
     for r in rows:
         text = r['message_text'] or ""
         score = extract_score(text)
-        if score > MIN_SCORE:
+        if score >= MIN_SCORE:
             candidates.append({
                 'post': dict(r),
                 'score': score,
@@ -114,7 +114,7 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
             })
 
     if not candidates:
-        print(f"没有找到 评分>{MIN_SCORE} 且 评论>={MIN_COMMENTS} 的帖子")
+        print(f"没有找到 评分>={MIN_SCORE} 且 评论>={MIN_COMMENTS} 的帖子")
         return None
 
     # 按评分排序取前 TOP_N
@@ -229,7 +229,7 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
     # 拼接最终报告
     header = (
         f"🏆 苏州硬了么高分老师 TOP {len(top)}\n"
-        f"（综合评分>{MIN_SCORE}，评价报告≥{MIN_COMMENTS}条，共{len(candidates)}位达标）\n\n"
+        f"（综合评分≥{MIN_SCORE}，评价报告≥{MIN_COMMENTS}条，共{len(candidates)}位达标）\n\n"
     )
     report = header + "\n\n".join(all_analyses)
     report += f"\n\n📊 数据统计：共 {len(top)} 位上榜老师，最高分 {top[0]['score']}，最低分 {top[-1]['score']}"
