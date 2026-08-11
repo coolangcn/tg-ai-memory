@@ -1,6 +1,5 @@
 # Telegram 频道分析平台 - Docker Compose (NAS 部署)
-# 使用方法: docker-compose up -d
-version: '3.8'
+# 使用方法: docker compose up -d
 
 services:
   tg-analyzer:
@@ -9,16 +8,17 @@ services:
       dockerfile: Dockerfile
     container_name: tg-analyzer
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    # 使用宿主机网络：直连 NAS 本机 PostgreSQL(127.0.0.1:5433)，Web 直接监听 8000
+    network_mode: host
     environment:
-      # 数据库（使用 NAS 上已有的 PostgreSQL）
-      - DATABASE_URL=postgresql://postgres:cncncncn@10.88.0.3:5433/tg_bot
+      # 数据库（NAS 上已有的 PostgreSQL，host 网络下用 127.0.0.1）
+      - DATABASE_URL=postgresql://postgres:cncncncn@127.0.0.1:5433/tg_bot
       # Telegram 账号
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
       - TELEGRAM_PHONE=${TELEGRAM_PHONE}
       - TELEGRAM_PASSWORD=${TELEGRAM_PASSWORD}
+      # NAS 可直连 Telegram，无需代理
       - TELEGRAM_PROXY=${TELEGRAM_PROXY:-}
       # 大模型
       - OPENAI_BASE_URL=https://api.moco.fun/v1
@@ -38,8 +38,6 @@ services:
       - ./telegram.session:/app/telegram.session
       # Web 模板（方便修改）
       - ./templates:/app/templates
-    networks:
-      - tg-network
     logging:
       driver: json-file
       options:
@@ -50,7 +48,3 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-networks:
-  tg-network:
-    driver: bridge
