@@ -15,7 +15,7 @@ from db import Database
 from gemini_service import GeminiService
 from collector import TelegramCollector
 from scheduler import BotScheduler
-from utils import setup_logging
+from utils import setup_logging, sync_today_comments
 from web import app as web_app, startup as web_startup, shutdown as web_shutdown
 
 logger = logging.getLogger(__name__)
@@ -24,20 +24,6 @@ logger = logging.getLogger(__name__)
 collector = None
 db = None
 gemini = None
-
-
-async def _sync_today_comments(collector: "TelegramCollector", db: "Database"):
-    """补采今日帖子的评论。"""
-    today = datetime.now(timezone.utc).date()
-    for chat_id in list(collector.watched_chat_ids):
-        posts = await db.get_posts_for_date(chat_id, today)
-        if not posts:
-            continue
-        entity = await collector.client.get_entity(chat_id)
-        post_ids = [(entity, p["message_id"], p["id"]) for p in posts]
-        logger.info(f"🔄 Syncing comments for {len(post_ids)} posts in chat {chat_id}...")
-        total = await collector.sync_comments_for_posts(post_ids)
-        logger.info(f"   Synced {total} comments")
 
 
 async def run_collector():
@@ -89,7 +75,7 @@ async def run_collector():
     # 启动时补采
     logger.info("🔄 Syncing recent posts...")
     await collector.sync_recent(limit=500)
-    await _sync_today_comments(collector, db)
+    await sync_today_comments(collector, db)
 
     # 调度器
     logger.info(f"⏰ Daily teacher report at {report_time}")

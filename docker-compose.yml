@@ -23,7 +23,7 @@ services:
       # 大模型
       - OPENAI_BASE_URL=https://api.moco.fun/v1
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=gemini-3.5-flash-lite
+      - OPENAI_MODEL=gemini-3.5-flash
       # 采集配置
       - WATCH_CHANNELS=@SZnewls
       - SUMMARY_CHAT_ID=me

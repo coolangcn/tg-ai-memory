@@ -2,6 +2,7 @@
 Utility functions for the Telegram analytics bot.
 """
 import logging
+from datetime import datetime, timezone
 from typing import List
 
 
@@ -63,3 +64,20 @@ def format_username(user) -> str:
         return full_name
     else:
         return f"User{user.id}"
+
+
+async def sync_today_comments(collector, db):
+    """补采今日帖子的评论（reply 方式，用于讨论组增量）。
+    注意：频道评价主要来自讨论组的"报告模板"，按老师名字关联，
+    此函数仅作为辅助增量，不影响榜单主流程。
+    """
+    today = datetime.now(timezone.utc).date()
+    for chat_id in list(collector.watched_chat_ids):
+        posts = await db.get_posts_for_date(chat_id, today)
+        if not posts:
+            continue
+        entity = await collector.client.get_entity(chat_id)
+        post_ids = [(entity, p["message_id"], p["id"]) for p in posts]
+        total = await collector.sync_comments_for_posts(post_ids)
+        if total:
+            logging.getLogger(__name__).info(f"   Synced {total} comments for chat {chat_id}")

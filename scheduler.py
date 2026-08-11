@@ -1,5 +1,5 @@
 """
-调度器：每日精华总结 + 数据库清理。
+调度器：高分榜单报告 + 每日精华总结 + 数据库清理。
 """
 import logging
 from datetime import datetime
@@ -9,8 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 from collector import TelegramCollector
 from db import Database
 from gemini_service import GeminiService
-from utils import chunk_text
-from main import _sync_today_comments
+from utils import chunk_text, sync_today_comments
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +37,22 @@ class BotScheduler:
         except Exception as e:
             logger.error(f"❌ Cleanup task failed: {e}")
 
+    async def daily_ranking_task(self):
+        """定时生成并发送高分老师榜单报告（图文并茂）。"""
+        logger.info("⏰ Running scheduled ranking report task...")
+        try:
+            # 先补采评论（报告），确保榜单数据是最新的
+            await sync_today_comments(self.collector, self.db)
+
+            from send_report import generate_and_send
+            report = await generate_and_send(self.db, self.collector, self.gemini)
+            if report:
+                logger.info("✅ Ranking report sent")
+            else:
+                logger.info("No eligible teachers, ranking report skipped")
+        except Exception as e:
+            logger.error(f"❌ Ranking report task failed: {e}")
+
     async def daily_summary_task(self):
         """生成并发送今日老师分析与评分报告。"""
         logger.info("⏰ Running scheduled daily teacher report task...")
@@ -46,7 +61,7 @@ class BotScheduler:
             await self.collector.sync_recent(limit=500)
 
             # 1.5 补采今日帖子的评论
-            await _sync_today_comments(self.collector, self.db)
+            await sync_today_comments(self.collector, self.db)
 
             # 2. 汇总今日所有目标来源的帖子+评论
             today = datetime.now().date()
@@ -100,6 +115,16 @@ class BotScheduler:
             replace_existing=True
         )
         logger.info(f"📅 Scheduled: Daily digest at {hour:02d}:{minute:02d} (server local time)")
+
+        # 高分榜单报告（每天 09:00，与每日精华错开）
+        self.scheduler.add_job(
+            self.daily_ranking_task,
+            CronTrigger(hour=9, minute=0),
+            id='daily_ranking',
+            name='Daily Ranking Report',
+            replace_existing=True
+        )
+        logger.info("📅 Scheduled: Ranking report at 09:00 (server local time)")
 
         self.scheduler.add_job(
             self.cleanup_task,
