@@ -17,8 +17,8 @@ from collector import TelegramCollector
 
 load_dotenv()
 
-# 讨论组 chat_id（之前诊断得到）
-DISCUSSION_CHAT_ID = -1003367541028
+# 讨论组 chat_id（可用环境变量覆盖）
+DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID", "-1003367541028"))
 
 
 def extract_teacher_from_report(text: str):
