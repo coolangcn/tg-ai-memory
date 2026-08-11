@@ -1,11 +1,20 @@
-"""高分老师榜单报告 - 图文并茂版。
+"""高分老师榜单报告 - 程序化排版 + AI 内容增强版。
+
 过滤条件：综合评分 >= 9.18 且 有效评价(报告) >= 10 条。
-按评分排序取前 20 名，附图片、标签、评论总结、原帖链接。
+
+设计要点：
+1. 排名/布局由代码统一控制：按综合评分排序、固定模板，保证一目了然、连续不乱；
+2. AI 只负责内容增强：一次调用处理全部老师，返回严格 JSON（标签/总结/精选评价），
+   不参与排名输出，避免多批次导致排名错乱；
+3. 信息丰富：综合分、报告数、用户均分、发帖日期、六项分项、标签、帖子摘要、
+   AI 总结、AI 精选评价、低分提醒、原帖链接；
+4. AI 失败自动回退本地提取，报告永不中断。
 """
 import asyncio
+import json
 import os
 import re
-import random
+from datetime import datetime
 from dotenv import load_dotenv
 from db import Database
 from gemini_service import GeminiService
@@ -17,7 +26,15 @@ CHANNEL_ID = -1002460327295
 MIN_SCORE = 9.18
 MIN_COMMENTS = 10
 TOP_N = 20
-MAX_COMMENTS_PER_TEACHER = 12  # 上下文采样上限
+MAX_QUOTE_LEN = 45
+SEP = "━" * 26
+RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+# AI 内容生成模型（按顺序重试；可用 RANKING_AI_MODEL 环境变量覆盖主力模型）
+# 经实测：deepseek-chat 中文总结质量好、速度快；gemini-3.5-flash / gpt-5.4-mini 作备选
+PRIMARY_MODEL = os.getenv("RANKING_AI_MODEL", "deepseek-chat") or "deepseek-chat"
+FALLBACK_MODELS = ["gemini-3.5-flash", "gpt-5.4-mini"]
+AI_BATCH_SIZE = 10  # 每组最多老师数：一次调用多位，避免单次输出超长截断
 
 
 def extract_score(text: str) -> float:
@@ -31,9 +48,7 @@ def extract_teacher_name(text: str) -> str:
     if not text:
         return "未知"
     m = re.search(r'👧#(\w+)', text)
-    if m:
-        return m.group(1)
-    return "未知"
+    return m.group(1) if m else "未知"
 
 
 def extract_detail_scores(text: str) -> dict:
@@ -56,7 +71,6 @@ def extract_detail_scores(text: str) -> dict:
 
 def extract_tags(text: str) -> list:
     tags = re.findall(r'#(\w+)', text or '')
-    # 过滤掉已经作为名字/区域的常见标签
     stop = {'苏州', '硬了么'}
     return [t for t in tags if t not in stop][:8]
 
@@ -67,14 +81,59 @@ def extract_report_score(report_text: str) -> float:
     return float(m.group(1)) if m else 0.0
 
 
-def summarize_report(report_text: str, max_len: int = 250) -> str:
-    """压缩报告：保留关键字段和评价。"""
+def fmt_score(v) -> str:
+    """9.0 -> 9、9.55 -> 9.6，避免多余小数。"""
+    if not v:
+        return "-"
+    return f"{float(v):.1f}".rstrip('0').rstrip('.')
+
+
+def extract_quote(comment_text: str) -> str:
+    """从报告里提取一句可引用的话（个人评价总结/优点），用于 AI 失败回退。"""
+    t = comment_text or ''
+    for pat in [r'【个人评价总结】([^【\n]+)', r'【优点】([^【]+)', r'【整体评价】([^【\n]+)']:
+        m = re.search(pat, t)
+        if m:
+            q = m.group(1).strip()
+            if q and q not in ('无', '无。', '暂无'):
+                return q[:MAX_QUOTE_LEN]
+    return ""
+
+
+def post_excerpt(text: str, max_len: int = 60) -> str:
+    """帖子原文摘要（保留价格/区域等参考信息）。"""
+    if not text:
+        return ""
+    t = re.sub(r'#\w+', '', text)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t[:max_len]
+
+
+def rank_label(rank: int) -> str:
+    medal = RANK_EMOJI.get(rank)
+    return f"{medal} 第{rank}名" if medal else f"第{rank}名"
+
+
+def build_overview(top) -> str:
+    """全榜总览：一行一位，一目了然。"""
+    lines = [f"📋 全榜总览（{len(top)}位，按综合评分排名）"]
+    for i, item in enumerate(top, 1):
+        ts = item['post']['created_at'].strftime('%m-%d') if item['post'].get('created_at') else '??'
+        lines.append(
+            f"{RANK_EMOJI.get(i, f'{i}.')} {item['teacher']}  "
+            f"⭐{fmt_score(item['score'])}  💬{item['comment_count']}份  "
+            f"📊均{fmt_score(item['avg_report_score'])}  📅{ts}"
+        )
+    return "\n".join(lines)
+
+
+def summarize_report(report_text: str, max_len: int = 90) -> str:
+    """压缩单条报告：保留关键字段，用于喂给 AI 的上下文。"""
     if not report_text:
         return ""
     t = report_text.strip()
-    # 提取关键部分：优缺点和个人评价
     key_parts = []
-    for pat in [r'【过程描述】(.{0,200})', r'【优点】([^【]{0,80})', r'【建议/缺点】([^【]{0,80})', r'【个人评价总结】([^【\n]{0,60})']:
+    for pat in [r'【过程描述】(.{0,60})', r'【优点】([^【]{0,50})', r'【建议/缺点】([^【]{0,40})', r'【个人评价总结】([^【\n]{0,40})']:
         m = re.search(pat, t)
         if m and m.group(1).strip():
             key_parts.append(m.group(1).strip())
@@ -83,9 +142,213 @@ def summarize_report(report_text: str, max_len: int = 250) -> str:
     return t[:max_len]
 
 
-async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID):
+def clean_ai_text(s: str) -> str:
+    """清理 AI 输出中的杂散空白（中文内容不应有空格，含零宽字符）。"""
+    if not s:
+        return ""
+    # 普通空白 + 全角空格 + 零宽空格/连接符等
+    s = re.sub(r'[\s\u3000\u200b\u200c\u200d\ufeff\u00a0]+', '', s)
+    return s.strip()
+
+
+def clean_ai_content(obj: dict) -> dict:
+    """统一清理 AI 返回的字段。"""
+    tags = []
+    for t in (obj.get("tags") or []):
+        t = clean_ai_text(str(t))
+        if t and t not in tags:
+            tags.append(t)
+    quotes = []
+    for q in (obj.get("quotes") or []):
+        q = clean_ai_text(str(q))
+        if q and q not in quotes:
+            quotes.append(q)
+    return {
+        "tags": tags,
+        "summary": clean_ai_text(obj.get("summary") or ""),
+        "quotes": quotes,
+    }
+
+
+# ── AI 内容生成（JSON 结构化，不输出排名） ──
+
+def parse_ai_json(text: str) -> list:
+    """从模型输出中提取 JSON 数组，容忍 markdown 围栏和前后缀文字。"""
+    if not text:
+        return []
+    # 去掉 ```json ... ``` 围栏
+    t = re.sub(r'```(?:json)?', '', text).strip()
+    # 直接尝试整体解析
+    try:
+        data = json.loads(t)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    # 提取第一个 [...] 块
+    m = re.search(r'\[.*\]', t, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def build_ai_context(top) -> str:
+    """一次性构造全部老师的精简上下文（每位 1 条帖子摘要 + 最多 6 条精选评论）。"""
+    parts = []
+    for i, item in enumerate(top, 1):
+        post = item['post']
+        text = post['message_text'] or ""
+        ts = post['created_at'].strftime('%Y-%m-%d') if post.get('created_at') else ''
+        ctx = (
+            f"【第{i}位】\n"
+            f"名字：{item['teacher']}（帖子时间 {ts}）\n"
+            f"综合评分：{item['score']}/10，报告数：{item['comment_count']}\n"
+            f"帖子内容：{text[:150]}\n"
+            f"用户评价抽样（[分数] 摘要）：\n"
+        )
+        for sc, ctext in item['comments'][:6]:
+            summ = summarize_report(ctext)
+            if summ:
+                ctx += f"  - [{fmt_score(sc)}分] {summ}\n"
+        parts.append(ctx.rstrip())
+    return "\n\n".join(parts)
+
+
+def build_ai_prompt(batch) -> str:
+    ctx = build_ai_context(batch)
+    return f"""你是 Telegram 频道「苏州硬了么」的资深分析师，擅长从用户评价报告中提炼老师特点。
+
+下面是一组高分老师的数据（共 {len(batch)} 位，已按综合评分从高到低排序）：
+
+=== 数据 ===
+{ctx}
+
+=== 任务 ===
+针对每一位老师，提炼：标签（3-5个，如：服务好、身材棒、性价比高、颜值高、温柔、会聊天、回头客多、真实可靠）、
+总结（2-3句，归纳核心特点：颜值/身材/服务/性格/性价比）、
+精选评价（从提供的用户评价中选1-2条最有说服力的原话，每条不超过50字，必须忠于原文）。
+
+=== 输出格式 ===
+只输出一个 JSON 数组（不要输出任何其他文字、注释或 Markdown 围栏），
+数组顺序必须与数据中老师的顺序一一对应，每位老师一个对象：
+
+[
+  {{"name": "老师名", "tags": ["标签1", "标签2", "标签3"], "summary": "总结", "quotes": ["原话1", "原话2"]}},
+  ...
+]
+
+要求：严格基于提供的数据，禁止编造；name 必须与数据中的名字完全一致。"""
+
+
+async def generate_ai_content(gemini, top) -> dict:
+    """调用 AI 生成全部老师的内容（分块调用，块内一次处理多位）。
+    返回 {name: {"tags": [...], "summary": str, "quotes": [...]}}。
+    失败回退本地数据。"""
+    if not top or gemini is None:
+        return {}
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("  ⚠️ 无 OPENAI_API_KEY，跳过 AI 内容生成", flush=True)
+        return {}
+
+    models = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
+    result = {}
+
+    for start in range(0, len(top), AI_BATCH_SIZE):
+        batch = top[start:start + AI_BATCH_SIZE]
+        names = "、".join(x['teacher'] for x in batch)
+        prompt = build_ai_prompt(batch)
+
+        ok = False
+        for model in models:
+            try:
+                svc = GeminiService(api_key, model=model)
+                text = await svc._chat(prompt, max_tokens=6000)
+                data = parse_ai_json(text)
+                if not data:
+                    print(f"  ⚠️ AI({model}) 输出无法解析，尝试下一模型", flush=True)
+                    continue
+                for obj in data:
+                    if isinstance(obj, dict) and obj.get("name"):
+                        result[str(obj["name"]).strip()] = clean_ai_content(obj)
+                print(f"  ✅ AI({model}) 处理 [{names}] 成功", flush=True)
+                ok = True
+                break
+            except Exception as e:
+                print(f"  ⚠️ AI({model}) 失败: {str(e)[:120]}", flush=True)
+                await asyncio.sleep(2)
+        if not ok:
+            print(f"  ⚠️ 分组 [{names}] 全部模型失败，使用本地数据回退", flush=True)
+        await asyncio.sleep(2)  # 避免 TPM 限制
+
+    print(f"  📦 AI 内容汇总：{len(result)}/{len(top)} 位老师", flush=True)
+    return result
+
+
+# ── 报告组装 ──
+
+def build_teacher_block(rank: int, item, ai=None) -> str:
+    """单个老师详情块：信息丰富、格式固定。ai 为可选 AI 内容 dict。"""
+    post = item['post']
+    text = post['message_text'] or ""
+    msg_id = post.get('message_id', '')
+    ts = post['created_at'].strftime('%Y-%m-%d') if post.get('created_at') else '未知'
+    link = f"https://t.me/SZnewls/{msg_id}" if msg_id else "无链接"
+    ai = ai or {}
+
+    lines = [SEP, f"{rank_label(rank)}：{item['teacher']}"]
+    lines.append(
+        f"⭐ 综合评分 {fmt_score(item['score'])}/10 ｜ "
+        f"💬 {item['comment_count']}份报告 ｜ 📊 用户均分 {fmt_score(item['avg_report_score'])}"
+    )
+    lines.append(f"📅 发帖：{ts}")
+
+    detail = item['detail_scores']
+    if detail:
+        lines.append(f"📊 分项：{'  '.join(f'{k}{fmt_score(v)}' for k, v in detail.items())}")
+
+    # 标签：AI 优先，回退帖子标签
+    tags = ai.get('tags') or item['tags']
+    if tags:
+        lines.append(f"🏷 标签：{'、'.join(tags[:6])}")
+
+    excerpt = post_excerpt(text)
+    if excerpt:
+        lines.append(f"📄 帖子：{excerpt}...")
+
+    # 总结：AI 生成
+    summary = ai.get('summary', '').strip()
+    if summary:
+        lines.append(f"📝 总结：{summary}")
+
+    # 精选评价：AI quotes 优先，回退本地高分摘录
+    quotes = ai.get('quotes') or []
+    if quotes:
+        lines.append(f"💬 用户评价：" + "；".join(f"“{q[:MAX_QUOTE_LEN]}”" for q in quotes[:2]))
+    else:
+        bq = item.get('best_quotes', [])
+        if bq:
+            sc, q = bq[0]
+            lines.append(f"💬 用户评价：“{q}”（{fmt_score(sc)}分）")
+
+    warnings = item.get('low_warnings', [])
+    if warnings:
+        sc, q = warnings[0]
+        lines.append(f"⚠️ 低分提醒：“{q}”（{fmt_score(sc)}分）")
+
+    lines.append(f"🔗 原帖：{link}")
+    return "\n".join(lines)
+
+
+async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNEL_ID):
     """核心函数：生成榜单报告并发送到收藏夹。供 main 调度器和独立脚本复用。"""
-    # 获取评分 > 9 的帖子及评论数
+    # 获取达标帖子（综合评分 + 评论数）
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT p.id, p.message_id, p.message_text, p.created_at,
@@ -117,13 +380,13 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
         print(f"没有找到 评分>={MIN_SCORE} 且 评论>={MIN_COMMENTS} 的帖子")
         return None
 
-    # 按评分排序取前 TOP_N
-    candidates.sort(key=lambda x: x['score'], reverse=True)
+    # 排名：综合评分优先，同分按报告数（代码统一排序，AI 不参与）
+    candidates.sort(key=lambda x: (-x['score'], -x['comment_count']))
     top = candidates[:TOP_N]
 
     print(f"🎯 候选 {len(candidates)} 位，取前 {len(top)} 名", flush=True)
 
-    # 为每位老师加载评论并采样
+    # 为每位老师加载评论，计算均分 + 摘录 + 采样
     for item in top:
         async with db.pool.acquire() as conn:
             comments = await conn.fetch("""
@@ -133,129 +396,82 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
             """, item['post']['id'])
         comments = [dict(c) for c in comments]
 
-        # 采样：按报告评分排序，高低混合取 MAX_COMMENTS_PER_TEACHER 条
-        scored = [(extract_report_score(c['message_text']), c) for c in comments]
+        scored = [(extract_report_score(c['message_text']), c['message_text']) for c in comments]
         scored.sort(key=lambda x: x[0], reverse=True)
-        if len(scored) > MAX_COMMENTS_PER_TEACHER:
-            # 高分 + 低分 + 随机中间
-            high = scored[:5]
-            low = scored[-2:]
-            mid = random.sample(scored[5:-2], min(MAX_COMMENTS_PER_TEACHER - 7, len(scored) - 7)) if len(scored) > 7 else []
-            sampled = high + mid + low
-        else:
-            sampled = scored
-        sampled.sort(key=lambda x: x[0], reverse=True)
-        item['comments'] = sampled
-        item['avg_report_score'] = sum(extract_report_score(c['message_text']) for c in comments) / len(comments) if comments else 0
-        print(f"  {item['teacher']}: score={item['score']} 评论={item['comment_count']} (采样{len(sampled)})", flush=True)
 
-    # 构建每批数据（每批 3 位老师，避免超 TPM 限制）
-    print("🤖 分批生成分析报告...", flush=True)
+        item['avg_report_score'] = sum(s for s, _ in scored) / len(scored) if scored else 0
 
-    def build_batch_context(batch):
-        parts = []
-        for item in batch:
-            post = item['post']
-            text = post['message_text'] or ""
-            ts = post['created_at'].strftime('%Y-%m-%d') if post.get('created_at') else ''
-            msg_id = post.get('message_id', '')
-            ctx = (
-                f"老师：{item['teacher']}（帖子时间 {ts}）\n"
-                f"帖子综合评分：{item['score']}/10，报告数：{item['comment_count']}\n"
-                f"分项评分：{item['detail_scores']}\n"
-                f"原帖链接：https://t.me/SZnewls/{msg_id}\n"
-                f"帖子简介：{text[:150]}\n"
-                f"用户评价报告抽样（[分数] 内容）:\n"
-            )
-            for sc, c in item['comments']:
-                summarized = summarize_report(c['message_text'], max_len=180)
-                if summarized:
-                    ctx += f"  - [{sc}分] {summarized}\n"
-            parts.append(ctx)
-        return "\n\n".join(parts)
+        # 采样：高分 + 低分 + 中间随机，供 AI 上下文
+        sample = scored[:5] + scored[-2:]
+        item['comments'] = sample
 
-    def build_batch_prompt(batch):
-        batch_ctx = build_batch_context(batch)
-        names = "、".join(x['teacher'] for x in batch)
-        return f"""你是 Telegram 频道「苏州硬了么」的资深分析师，擅长从用户评价报告中提炼老师特点。
+        # 本地回退用：高分摘录 + 低分提醒
+        quotes = []
+        for sc, t in scored:
+            q = extract_quote(t)
+            if q and not any(q in existing for _, existing in quotes):
+                quotes.append((sc, q))
+            if len(quotes) >= 2:
+                break
+        item['best_quotes'] = quotes
 
-下面是 {len(batch)} 位高分老师的帖子信息与用户评价报告抽样（[分数] 为报告评分）：
+        lows = [(s, t) for s, t in scored if 0 < s < 8]
+        warnings = []
+        for sc, t in lows:
+            q = extract_quote(t)
+            if q and not any(q in existing for _, existing in warnings):
+                warnings.append((sc, q))
+            if len(warnings) >= 2:
+                break
+        item['low_warnings'] = warnings
 
-=== 数据 ===
-{batch_ctx}
+        print(
+            f"  {item['teacher']}: score={item['score']} 报告={item['comment_count']} "
+            f"均分={item['avg_report_score']:.2f}",
+            flush=True,
+        )
 
-=== 任务 ===
-针对【{names}】这 {len(batch)} 位老师，每一位输出如下（全部中文）：
+    # ── AI 内容增强（一次调用，JSON 结构化） ──
+    print("🤖 生成 AI 内容（标签/总结/评价）...", flush=True)
+    ai_content = await generate_ai_content(gemini, top)
+    if not ai_content:
+        print("  ⚠️ AI 内容不可用，使用本地数据回退", flush=True)
 
-第N名：老师名
-🏷 标签：3-5个标签（如：服务好、身材棒、性价比高、颜值高、温柔、会聊天、回头客多、真实可靠等，基于评价内容）
-📊 分项：人照X 气质X 舒适X 态度X 身材X 服务X
-📝 总结：2-3句，结合评价归纳核心特点（颜值/身材/服务/性格/性价比）
-💬 用户评价：引用1-2条最有说服力的评价原话（简短）
-🔗 原帖：直接使用数据中提供的"原帖链接"
-
-要求：严格基于提供的数据，禁止编造；每条评价原话不超过50字；保持简洁。排名按数据中出现顺序即可。
-"""
-
-    # 分批生成
-    batch_size = 3
-    all_analyses = []
-    for i in range(0, len(top), batch_size):
-        batch = top[i:i + batch_size]
-        prompt = build_batch_prompt(batch)
-        try:
-            text = await gemini._chat(prompt, max_tokens=2000)
-            all_analyses.append(text)
-            print(f"  ✅ 批次 {i//batch_size + 1} 完成 ({len(batch)}位: {'、'.join(x['teacher'] for x in batch)})", flush=True)
-        except Exception as e:
-            err = str(e)
-            print(f"  ⚠️ 批次 {i//batch_size + 1} Gemini 被拦: {err[:100]}", flush=True)
-            # 回退：用 llama（无内容过滤），减少采样条数
-            try:
-                gemini_llama = GeminiService(os.getenv("OPENAI_API_KEY"), model="llama-3.3-70b-versatile")
-                # 临时减少采样
-                for item in batch:
-                    item['comments'] = item['comments'][:6]
-                prompt_retry = build_batch_prompt(batch)
-                text = await gemini_llama._chat(prompt_retry, max_tokens=2000)
-                all_analyses.append(text)
-                print(f"  ✅ 批次 {i//batch_size + 1} llama 重试成功", flush=True)
-            except Exception as e2:
-                print(f"  ❌ 批次 {i//batch_size + 1} llama 也失败: {str(e2)[:150]}", flush=True)
-                all_analyses.append(f"（{'、'.join(x['teacher'] for x in batch)} 分析生成失败，请在 Web 页面查看原帖）")
-        # 避免 TPM 限制
-        await asyncio.sleep(3)
-
-    # 拼接最终报告
+    # ── 程序化组装报告 ──
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
     header = (
         f"🏆 苏州硬了么高分老师 TOP {len(top)}\n"
-        f"（综合评分≥{MIN_SCORE}，评价报告≥{MIN_COMMENTS}条，共{len(candidates)}位达标）\n\n"
+        f"📊 筛选：综合评分≥{MIN_SCORE} · 报告≥{MIN_COMMENTS}条 · 达标{len(candidates)}位\n"
+        f"📅 生成时间：{now}\n\n"
+        f"{build_overview(top)}\n"
     )
-    report = header + "\n\n".join(all_analyses)
-    report += f"\n\n📊 数据统计：共 {len(top)} 位上榜老师，最高分 {top[0]['score']}，最低分 {top[-1]['score']}"
+    blocks = [build_teacher_block(i, item, ai_content.get(item['teacher'])) for i, item in enumerate(top, 1)]
+    footer = f"\n{SEP}\n📊 数据统计：上榜 {len(top)} 位 ｜ 最高 {fmt_score(top[0]['score'])} 分 ｜ 最低 {fmt_score(top[-1]['score'])} 分"
 
-    # 发到收藏夹
+    # 分段发送（按完整块切分，Telegram 单条上限约 4000 字）
     print("📤 发送到收藏夹...", flush=True)
     entity = await collector.client.get_entity("me")
 
-    # 文字报告分段发送
-    if len(report) > 4000:
-        parts = []
-        lines = report.split('\n')
-        current = ""
-        for line in lines:
-            if len(current) + len(line) + 1 > 4000:
-                parts.append(current)
-                current = line + '\n'
-            else:
-                current += line + '\n'
-        if current:
-            parts.append(current)
-        for i, part in enumerate(parts, 1):
-            await collector.client.send_message(entity, f"📊 榜单报告 ({i}/{len(parts)})\n\n{part}")
-            await asyncio.sleep(1)
-    else:
-        await collector.client.send_message(entity, report)
+    parts = []
+    current = header
+    for block in blocks:
+        if len(current) + len(block) + 1 > 3900:
+            parts.append(current.rstrip())
+            current = block + "\n"
+        else:
+            current += block + "\n"
+    if current.strip():
+        parts.append(current.rstrip())
+    if len(parts) > 1:
+        parts[-1] += footer
+
+    total_parts = len(parts)
+    for i, part in enumerate(parts, 1):
+        prefix = f"📋 榜单报告 ({i}/{total_parts})\n\n" if total_parts > 1 else ""
+        await collector.client.send_message(entity, prefix + part)
+        await asyncio.sleep(1)
+
+    report = header + "\n".join(blocks) + footer
 
     await asyncio.sleep(2)
 
@@ -270,11 +486,13 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
             msg = await collector.client.get_messages(channel_id, ids=msg_id)
             if not msg or not msg.media:
                 continue
+            detail = item['detail_scores']
+            detail_str = "  ".join(f"{k}{fmt_score(v)}" for k, v in detail.items()) if detail else ""
             caption = (
-                f"🏆 第{i}名：{item['teacher']}\n"
-                f"⭐ 综合评分：{item['score']}/10（{item['comment_count']}份报告）\n"
-                f"🏷 标签：{', '.join(item['tags'][:4])}\n"
-                f"📊 分项：{item['detail_scores']}\n"
+                f"{rank_label(i)}：{item['teacher']}\n"
+                f"⭐ 综合评分 {fmt_score(item['score'])}/10（{item['comment_count']}份报告，均分 {fmt_score(item['avg_report_score'])}）\n"
+                f"{'📊 ' + detail_str if detail_str else ''}\n"
+                f"🏷 标签：{'、'.join(item['tags'][:4]) if item['tags'] else '无'}\n"
                 f"🔗 https://t.me/SZnewls/{msg_id}"
             )
             await collector.client.send_file(entity, msg.media, caption=caption[:1000])
@@ -285,17 +503,12 @@ async def generate_and_send(db, collector, gemini, channel_id: int = CHANNEL_ID)
     # 剩余老师链接
     remaining = top[10:]
     if remaining:
-        links = "📋 第 11-20 名帖子链接：\n\n"
+        lines = ["📋 第 11-20 名原帖链接：", ""]
         for i, item in enumerate(remaining, 11):
             msg_id = item['post'].get('message_id')
-            line = f"{i}. {item['teacher']}（{item['score']}分，{item['comment_count']}份报告）→ https://t.me/SZnewls/{msg_id}\n"
-            if len(links) + len(line) > 4000:
-                await collector.client.send_message(entity, links)
-                links = "📋 链接（续）：\n\n"
-                await asyncio.sleep(1)
-            links += line
-        if links.strip():
-            await collector.client.send_message(entity, links)
+            lines.append(f"{i}. {item['teacher']}（⭐{fmt_score(item['score'])}，💬{item['comment_count']}份）→ https://t.me/SZnewls/{msg_id}")
+        links = "\n".join(lines)
+        await collector.client.send_message(entity, links)
 
     print("✅ 榜单已发送！", flush=True)
     return report
