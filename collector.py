@@ -125,11 +125,12 @@ class TelegramCollector:
         """把一条消息写入数据库（按 chat_id + message_id 去重），并保存媒体引用。
         SPA 广告帖子将被过滤掉，不保存。
         无文本的帖子（纯图片/视频）也会保存。
+        返回 db id；若为已存在的重复消息（评论）或 SPA 广告则返回 None。
         """
         # 过滤 SPA 广告（仅对帖子，且需要文本判断）
         if message_type == "post" and text and is_spa_ad(text):
             logger.debug(f"Filtered SPA ad: {msg.id}")
-            return
+            return None
 
         chat_id = msg.chat_id
         self.watched_chat_ids.add(chat_id)
@@ -170,6 +171,7 @@ class TelegramCollector:
             parent_message_id=parent_message_id,
             message_type=message_type,
         )
+        return db_id
 
     async def sync_recent(self, limit: int = 500):
         """补采：拉取每个目标最近的 limit 条帖子，入库。"""
@@ -193,6 +195,51 @@ class TelegramCollector:
                 logger.error(f"Sync failed for {entity}: {e}")
         logger.info(f"🔄 Sync finished: {total} posts stored, {filtered} SPA filtered")
         return total
+
+    async def full_sync_posts(self, entity=None, only_with_score: bool = False):
+        """全量同步：拉取频道的全部历史帖子（含最早的老帖），自动去重入库。
+        解决 sync_recent 只拉最近 limit 条导致的历史帖子漏采问题。
+        参数：
+          entity: 指定频道；None 则遍历所有监控频道。
+          only_with_score: True 则只保留含'综合评分'的老师帖，跳过广告/通知。
+        返回: 新增帖子数。
+        """
+        from telethon.errors import FloodWaitError
+
+        targets = [entity] if entity else list(self.watched_entities)
+        added = 0
+        skipped_dup = 0
+        filtered = 0
+        errors = 0
+
+        for ent in targets:
+            try:
+                async for m in self.client.iter_messages(ent):
+                    text = m.text or ""
+                    # 可选：只保留含"综合评分"的老师帖
+                    if only_with_score and "综合评分" not in text:
+                        continue
+                    # 过滤 SPA 广告
+                    if text and is_spa_ad(text):
+                        filtered += 1
+                        continue
+                    db_id = await self._store(m, text, message_type="post")
+                    if db_id:
+                        added += 1
+                    else:
+                        skipped_dup += 1
+                    if added % 200 == 0:
+                        logger.info(f"  📦 全量同步进度: 已入库 {added} 条, 跳过重复 {skipped_dup} 条, 过滤 {filtered} 条")
+            except FloodWaitError as e:
+                errors += 1
+                logger.warning(f"  ⏳ 全量同步 FloodWait {e.seconds}秒，等待后继续")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                errors += 1
+                logger.error(f"  ❌ 全量同步失败 {ent}: {str(e)[:80]}")
+
+        logger.info(f"🔄 全量同步完成: 新增 {added} 条, 过滤 {filtered} 条, 错误 {errors}")
+        return added
 
     async def sync_comments_for_posts(self, post_ids: list):
         """对指定的帖子列表拉取评论。post_ids 是 (entity, telegram_msg_id) 的列表。

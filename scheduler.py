@@ -135,6 +135,18 @@ class BotScheduler:
         except Exception as e:
             logger.error(f"❌ Post content sync task failed: {e}")
 
+    async def daily_full_post_sync_task(self):
+        """每日全量帖子同步：拉取频道全部历史帖子入库，防止漏采。
+        使用 iter_messages 全量遍历 + 数据库唯一索引自动去重，幂等可重复执行。
+        """
+        logger.info("⏰ Running daily full post sync task...")
+        try:
+            # 全量同步所有监控频道（只保留含'综合评分'的老师帖，过滤广告/通知）
+            added = await self.collector.full_sync_posts(only_with_score=True)
+            logger.info(f"✅ Full post sync completed: 新增 {added} 条帖子")
+        except Exception as e:
+            logger.error(f"❌ Full post sync task failed: {e}")
+
     async def daily_comment_backfill_task(self):
         """每日全量评论补抓：对所有帖子拉取评论，补全缺失部分。
         
@@ -347,7 +359,17 @@ class BotScheduler:
         )
         logger.info("📅 Scheduled: Database cleanup at 00:30")
 
-        # 全量评论补抓（每天 02:00，在清理之后、榜单之前）
+        # 全量帖子同步（每天 01:30，在清理之后、评论补抓之前）
+        self.scheduler.add_job(
+            self.daily_full_post_sync_task,
+            CronTrigger(hour=1, minute=30),
+            id='daily_full_post_sync',
+            name='Daily Full Post Sync',
+            replace_existing=True
+        )
+        logger.info("📅 Scheduled: Full post sync at 01:30")
+
+        # 全量评论补抓（每天 02:00，在帖子同步之后）
         self.scheduler.add_job(
             self.daily_comment_backfill_task,
             CronTrigger(hour=2, minute=0),
