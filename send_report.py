@@ -1,6 +1,6 @@
 """高分老师榜单报告 - 程序化排版 + AI 内容增强版。
 
-过滤条件：综合评分 >= 9.18 且 有效评价(报告) >= 10 条。
+过滤条件：综合评分 >= 9.13 且 有效评价(报告) >= 10 条。
 
 设计要点：
 1. 排名/布局由代码统一控制：按综合评分排序、固定模板，保证一目了然、连续不乱；
@@ -23,7 +23,7 @@ from collector import TelegramCollector
 load_dotenv()
 
 CHANNEL_ID = -1002460327295
-MIN_SCORE = 9.18
+MIN_SCORE = 9.13
 MIN_COMMENTS = 10
 TOP_N = 20
 MAX_QUOTE_LEN = 45
@@ -32,7 +32,7 @@ RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 # AI 内容生成模型（按顺序重试；可用 RANKING_AI_MODEL 环境变量覆盖主力模型）
 # 经实测：deepseek-chat 中文总结质量好、速度快；gemini-3.5-flash / gpt-5.4-mini 作备选
-PRIMARY_MODEL = os.getenv("RANKING_AI_MODEL", "deepseek-chat") or "deepseek-chat"
+PRIMARY_MODEL = os.getenv("RANKING_AI_MODEL", "deepseek-v4-flash-0731") or "deepseek-v4-flash-0731"
 FALLBACK_MODELS = ["gemini-3.5-flash", "gpt-5.4-mini"]
 AI_BATCH_SIZE = 10  # 每组最多老师数：一次调用多位，避免单次输出超长截断
 
@@ -119,10 +119,13 @@ def build_overview(top) -> str:
     lines = [f"📋 全榜总览（{len(top)}位，按综合评分排名）"]
     for i, item in enumerate(top, 1):
         ts = item['post']['created_at'].strftime('%m-%d') if item['post'].get('created_at') else '??'
+        valid_count = item.get('valid_report_count', item['comment_count'])
+        calc_score = item.get('comment_calculated_score', 0)
+        calc_str = f"  📈评论评{fmt_score(calc_score)}" if calc_score > 0 else ""
         lines.append(
             f"{RANK_EMOJI.get(i, f'{i}.')} {item['teacher']}  "
-            f"⭐{fmt_score(item['score'])}  💬{item['comment_count']}份  "
-            f"📊均{fmt_score(item['avg_report_score'])}  📅{ts}"
+            f"⭐{fmt_score(item['score'])}  💬{item['comment_count']}份(有效{valid_count}份)  "
+            f"📊均{fmt_score(item['avg_report_score'])}{calc_str}  📅{ts}"
         )
     return "\n".join(lines)
 
@@ -175,25 +178,40 @@ def clean_ai_content(obj: dict) -> dict:
 def parse_ai_json(text: str) -> list:
     """从模型输出中提取 JSON 数组，容忍 markdown 围栏和前后缀文字。"""
     if not text:
+        print("    ⚠️ parse_ai_json: 输入为空", flush=True)
         return []
+    
     # 去掉 ```json ... ``` 围栏
     t = re.sub(r'```(?:json)?', '', text).strip()
+    print(f"    📝 parse_ai_json: 清洗后长度={len(t)} 字符，前100字: {t[:100]!r}", flush=True)
+    
     # 直接尝试整体解析
     try:
         data = json.loads(t)
         if isinstance(data, list):
+            print(f"    ✅ parse_ai_json: 整体解析成功，共 {len(data)} 条", flush=True)
             return data
-    except Exception:
-        pass
+        else:
+            print(f"    ⚠️ parse_ai_json: 整体解析结果不是 list，类型为 {type(data).__name__}", flush=True)
+    except Exception as e:
+        print(f"    ⚠️ parse_ai_json: 整体解析失败: {str(e)[:150]}", flush=True)
+    
     # 提取第一个 [...] 块
     m = re.search(r'\[.*\]', t, re.S)
     if m:
+        print(f"    📝 parse_ai_json: 匹配到 [...] 块，长度={len(m.group(0))}", flush=True)
         try:
             data = json.loads(m.group(0))
             if isinstance(data, list):
+                print(f"    ✅ parse_ai_json: 块解析成功，共 {len(data)} 条", flush=True)
                 return data
-        except Exception:
-            pass
+            else:
+                print(f"    ⚠️ parse_ai_json: 块解析结果不是 list，类型为 {type(data).__name__}", flush=True)
+        except Exception as e:
+            print(f"    ⚠️ parse_ai_json: 块解析失败: {str(e)[:150]}", flush=True)
+    else:
+        print("    ⚠️ parse_ai_json: 未匹配到 [...] 块", flush=True)
+    
     return []
 
 
@@ -250,6 +268,7 @@ async def generate_ai_content(gemini, top) -> dict:
     返回 {name: {"tags": [...], "summary": str, "quotes": [...]}}。
     失败回退本地数据。"""
     if not top or gemini is None:
+        print("  ⚠️ AI 内容为空或 gemini 未初始化，跳过", flush=True)
         return {}
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -259,35 +278,64 @@ async def generate_ai_content(gemini, top) -> dict:
 
     models = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
     result = {}
+    
+    print(f"  📋 模型优先级队列: {models}", flush=True)
+    print(f"  📋 共 {len(top)} 位老师，分 {(len(top) + AI_BATCH_SIZE - 1) // AI_BATCH_SIZE} 批处理", flush=True)
 
     for start in range(0, len(top), AI_BATCH_SIZE):
         batch = top[start:start + AI_BATCH_SIZE]
         names = "、".join(x['teacher'] for x in batch)
         prompt = build_ai_prompt(batch)
+        print(f"\n  🔄 第 {start // AI_BATCH_SIZE + 1} 批: [{names}] ({len(batch)} 位老师)", flush=True)
+        print(f"    📏 Prompt 长度: {len(prompt)} 字符", flush=True)
 
         ok = False
         for model in models:
+            print(f"    🤖 尝试模型: {model}", flush=True)
             try:
                 svc = GeminiService(api_key, model=model)
                 text = await svc._chat(prompt, max_tokens=6000)
+                print(f"    📥 收到响应: {len(text)} 字符，前200字: {text[:200]!r}", flush=True)
+                
                 data = parse_ai_json(text)
                 if not data:
-                    print(f"  ⚠️ AI({model}) 输出无法解析，尝试下一模型", flush=True)
+                    print(f"    ⚠️ AI({model}) 输出无法解析为有效 JSON，尝试下一模型", flush=True)
                     continue
+                
+                print(f"    📊 解析得到 {len(data)} 位老师数据，批次预期 {len(batch)} 位", flush=True)
+                matched = 0
                 for obj in data:
                     if isinstance(obj, dict) and obj.get("name"):
-                        result[str(obj["name"]).strip()] = clean_ai_content(obj)
-                print(f"  ✅ AI({model}) 处理 [{names}] 成功", flush=True)
+                        clean_obj = clean_ai_content(obj)
+                        result[str(obj["name"]).strip()] = clean_obj
+                        matched += 1
+                        print(f"      ✅ {obj['name']}: tags={len(clean_obj['tags'])}个, summary={len(clean_obj['summary'])}字, quotes={len(clean_obj['quotes'])}条", flush=True)
+                
+                if matched == 0:
+                    print(f"    ⚠️ 解析成功但无有效 name 字段，尝试下一模型", flush=True)
+                    continue
+                    
+                print(f"  ✅ AI({model}) 处理 [{names}] 成功 ({matched}/{len(batch)} 位匹配)", flush=True)
                 ok = True
                 break
             except Exception as e:
-                print(f"  ⚠️ AI({model}) 失败: {str(e)[:120]}", flush=True)
+                print(f"    ❌ AI({model}) 异常: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 await asyncio.sleep(2)
+        
         if not ok:
-            print(f"  ⚠️ 分组 [{names}] 全部模型失败，使用本地数据回退", flush=True)
+            print(f"  ❌ 分组 [{names}] 全部模型失败，将使用本地数据回退", flush=True)
+            # 打印回退信息
+            for item in batch:
+                local_tags = item.get('tags', [])
+                local_quotes = item.get('best_quotes', [])
+                print(f"    🔙 回退 [{item['teacher']}]: 本地标签={len(local_tags)}个, 本地高分摘录={len(local_quotes)}条", flush=True)
+        
         await asyncio.sleep(2)  # 避免 TPM 限制
 
-    print(f"  📦 AI 内容汇总：{len(result)}/{len(top)} 位老师", flush=True)
+    print(f"\n  📦 AI 内容汇总: 成功 {len(result)}/{len(top)} 位老师", flush=True)
+    if len(result) < len(top):
+        missing = [item['teacher'] for item in top if item['teacher'] not in result]
+        print(f"    ⚠️ 未覆盖的老师: {', '.join(missing)}", flush=True)
     return result
 
 
@@ -302,10 +350,13 @@ def build_teacher_block(rank: int, item, ai=None) -> str:
     link = f"https://t.me/SZnewls/{msg_id}" if msg_id else "无链接"
     ai = ai or {}
 
+    valid_count = item.get('valid_report_count', item['comment_count'])
+    calc_score = item.get('comment_calculated_score', 0)
+    calc_str = f" ｜ 📈 评论评{fmt_score(calc_score)}" if calc_score > 0 else ""
     lines = [SEP, f"{rank_label(rank)}：{item['teacher']}"]
     lines.append(
         f"⭐ 综合评分 {fmt_score(item['score'])}/10 ｜ "
-        f"💬 {item['comment_count']}份报告 ｜ 📊 用户均分 {fmt_score(item['avg_report_score'])}"
+        f"💬 {item['comment_count']}份报告(有效{valid_count}份) ｜ 📊 用户均分 {fmt_score(item['avg_report_score'])}{calc_str}"
     )
     lines.append(f"📅 发帖：{ts}")
 
@@ -317,6 +368,8 @@ def build_teacher_block(rank: int, item, ai=None) -> str:
     tags = ai.get('tags') or item['tags']
     if tags:
         lines.append(f"🏷 标签：{'、'.join(tags[:6])}")
+    else:
+        print(f"    ⚠️ [{item['teacher']}] 标签缺失: AI无 + 本地无", flush=True)
 
     excerpt = post_excerpt(text)
     if excerpt:
@@ -326,6 +379,8 @@ def build_teacher_block(rank: int, item, ai=None) -> str:
     summary = ai.get('summary', '').strip()
     if summary:
         lines.append(f"📝 总结：{summary}")
+    else:
+        print(f"    ⚠️ [{item['teacher']}] 总结缺失: AI总结为空", flush=True)
 
     # 精选评价：AI quotes 优先，回退本地高分摘录
     quotes = ai.get('quotes') or []
@@ -336,6 +391,9 @@ def build_teacher_block(rank: int, item, ai=None) -> str:
         if bq:
             sc, q = bq[0]
             lines.append(f"💬 用户评价：“{q}”（{fmt_score(sc)}分）")
+            print(f"    🔙 [{item['teacher']}] 评价回退到本地摘录", flush=True)
+        else:
+            print(f"    ⚠️ [{item['teacher']}] 评价缺失: AI无 + 本地无", flush=True)
 
     warnings = item.get('low_warnings', [])
     if warnings:
@@ -346,13 +404,40 @@ def build_teacher_block(rank: int, item, ai=None) -> str:
     return "\n".join(lines)
 
 
+async def _clear_history(collector, batch_size: int = 50):
+    """直接清空收藏夹中的所有消息。"""
+    from telethon.tl.types import InputMessagesFilterEmpty
+    
+    entity = await collector.client.get_entity("me")
+    deleted = 0
+    
+    try:
+        async for msg in collector.client.iter_messages(
+            entity, 
+            limit=None,  # 检查全部
+            filter=InputMessagesFilterEmpty()
+        ):
+            await msg.delete()
+            deleted += 1
+            await asyncio.sleep(0.1)
+            if deleted % batch_size == 0:
+                print(f"  🗑️ 已删除 {deleted} 条消息...", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ 清空收藏夹时出错: {e}", flush=True)
+    
+    if deleted > 0:
+        print(f"  🗑️ 已清空收藏夹，共删除 {deleted} 条消息", flush=True)
+
+
 async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNEL_ID):
     """核心函数：生成榜单报告并发送到收藏夹。供 main 调度器和独立脚本复用。"""
-    # 获取达标帖子（综合评分 + 评论数）
+    # 先清除历史收藏消息
+    await _clear_history(collector)
     async with db.pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT p.id, p.message_id, p.message_text, p.created_at,
-                   COUNT(c.id) AS comment_count
+                   COUNT(c.id) AS comment_count,
+                   p.comment_calculated_score
             FROM messages p
             LEFT JOIN messages c ON c.parent_message_id = p.id AND c.message_type = 'comment'
             WHERE p.message_type = 'post' AND p.chat_id = $1
@@ -374,6 +459,7 @@ async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNE
                 'detail_scores': extract_detail_scores(text),
                 'tags': extract_tags(text),
                 'comment_count': r['comment_count'],
+                'comment_calculated_score': r['comment_calculated_score'] or 0,
             })
 
     if not candidates:
@@ -399,7 +485,10 @@ async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNE
         scored = [(extract_report_score(c['message_text']), c['message_text']) for c in comments]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-        item['avg_report_score'] = sum(s for s, _ in scored) / len(scored) if scored else 0
+        # 均分：只统计有效评分（>0），排除无评分评论
+        valid_scores = [s for s, _ in scored if s > 0]
+        item['avg_report_score'] = sum(valid_scores) / len(valid_scores) if valid_scores else 0
+        item['valid_report_count'] = len(valid_scores)  # 有效评分数量
 
         # 采样：高分 + 低分 + 中间随机，供 AI 上下文
         sample = scored[:5] + scored[-2:]
@@ -425,15 +514,33 @@ async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNE
                 break
         item['low_warnings'] = warnings
 
+        calc_score = item.get('comment_calculated_score', 0)
+        calc_str = f"  📈评论评{fmt_score(calc_score)}" if calc_score > 0 else ""
         print(
             f"  {item['teacher']}: score={item['score']} 报告={item['comment_count']} "
-            f"均分={item['avg_report_score']:.2f}",
+            f"均分={item['avg_report_score']:.2f} (有效评分{item['valid_report_count']}条){calc_str}",
             flush=True,
         )
 
     # ── AI 内容增强（一次调用，JSON 结构化） ──
     print("🤖 生成 AI 内容（标签/总结/评价）...", flush=True)
     ai_content = await generate_ai_content(gemini, top)
+    
+    print("\n" + "="*50, flush=True)
+    print("📊 AI 覆盖情况检查:", flush=True)
+    for item in top:
+        name = item['teacher']
+        ai = ai_content.get(name)
+        if ai:
+            has_tags = bool(ai.get('tags'))
+            has_summary = bool(ai.get('summary'))
+            has_quotes = bool(ai.get('quotes'))
+            status = "✅" if (has_tags and has_summary and has_quotes) else "⚠️"
+            print(f"  {status} {name}: tags={'✓' if has_tags else '✗'} summary={'✓' if has_summary else '✗'} quotes={'✓' if has_quotes else '✗'}", flush=True)
+        else:
+            print(f"  ❌ {name}: 无 AI 数据，将全部使用本地回退", flush=True)
+    print("="*50 + "\n", flush=True)
+    
     if not ai_content:
         print("  ⚠️ AI 内容不可用，使用本地数据回退", flush=True)
 
@@ -488,9 +595,10 @@ async def generate_and_send(db, collector, gemini=None, channel_id: int = CHANNE
                 continue
             detail = item['detail_scores']
             detail_str = "  ".join(f"{k}{fmt_score(v)}" for k, v in detail.items()) if detail else ""
+            valid_count = item.get('valid_report_count', item['comment_count'])
             caption = (
                 f"{rank_label(i)}：{item['teacher']}\n"
-                f"⭐ 综合评分 {fmt_score(item['score'])}/10（{item['comment_count']}份报告，均分 {fmt_score(item['avg_report_score'])}）\n"
+                f"⭐ 综合评分 {fmt_score(item['score'])}/10（{item['comment_count']}份报告，有效{valid_count}份，均分 {fmt_score(item['avg_report_score'])}）\n"
                 f"{'📊 ' + detail_str if detail_str else ''}\n"
                 f"🏷 标签：{'、'.join(item['tags'][:4]) if item['tags'] else '无'}\n"
                 f"🔗 https://t.me/SZnewls/{msg_id}"

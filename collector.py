@@ -6,13 +6,13 @@ Telethon collector - 用用户账号采集 Telegram 频道/群组消息。
 - 用户账号可以读取自己订阅的所有频道、加入的所有群组，
   即使没有管理权限（只有访问权限）也能采集。
 """
+import asyncio
 import logging
 import os
 from datetime import timezone
-from pathlib import Path
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, User, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import Channel, User
 
 from db import Database
 from gemini_service import GeminiService
@@ -20,7 +20,6 @@ from gemini_service import GeminiService
 logger = logging.getLogger(__name__)
 
 SESSION_NAME = "telegram"
-MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
 
 # SPA 广告过滤关键词
 SPA_KEYWORDS = [
@@ -172,68 +171,6 @@ class TelegramCollector:
             message_type=message_type,
         )
 
-        # 记录媒体信息（不下载，用 Telegram 链接访问）
-        if db_id and message_type == "post":
-            await self._save_media_reference(msg, db_id)
-
-    async def _save_media_reference(self, msg, db_message_id: int):
-        """保存媒体文件的 Telegram 引用（不下载，节省空间）。"""
-        try:
-            if not msg.media:
-                return
-
-            # 判断媒体类型
-            if isinstance(msg.media, MessageMediaPhoto):
-                file_type = "image"
-                mime_type = "image/jpeg"
-            elif isinstance(msg.media, MessageMediaDocument):
-                doc = msg.media.document
-                mime = getattr(doc, 'mime_type', '') or ''
-                if mime.startswith('video/'):
-                    file_type = "video"
-                elif mime.startswith('image/'):
-                    file_type = "image"
-                else:
-                    file_type = "file"
-                mime_type = mime
-            else:
-                return
-
-            # 保存媒体引用（通过 message_id 可在 Telegram 查看）
-            file_size = 0
-            if isinstance(msg.media, MessageMediaDocument):
-                file_size = getattr(msg.media.document, 'size', 0) or 0
-
-            await self.db.insert_media(
-                message_id=db_message_id,
-                file_type=file_type,
-                file_path=f"telegram://{msg.chat_id}/{msg.id}",
-                file_name=f"{file_type}_{msg.id}",
-                file_size=file_size,
-                mime_type=mime_type,
-                telegram_file_ref=f"{msg.chat_id}/{msg.id}",
-            )
-
-        except Exception as e:
-            logger.error(f"Error saving media reference for msg {msg.id}: {e}")
-
-    @staticmethod
-    def _get_file_ext(media, file_type: str) -> str:
-        """根据媒体类型返回文件扩展名。"""
-        if isinstance(media, MessageMediaPhoto):
-            return ".jpg"
-        if isinstance(media, MessageMediaDocument):
-            mime = getattr(media.document, 'mime_type', '') or ''
-            ext_map = {
-                'video/mp4': '.mp4',
-                'video/webm': '.webm',
-                'image/jpeg': '.jpg',
-                'image/png': '.png',
-                'image/gif': '.gif',
-            }
-            return ext_map.get(mime, '.bin')
-        return '.bin'
-
     async def sync_recent(self, limit: int = 500):
         """补采：拉取每个目标最近的 limit 条帖子，入库。"""
         total = 0
@@ -258,8 +195,16 @@ class TelegramCollector:
         return total
 
     async def sync_comments_for_posts(self, post_ids: list):
-        """对指定的帖子列表拉取评论。post_ids 是 (entity, telegram_msg_id) 的列表。"""
+        """对指定的帖子列表拉取评论。post_ids 是 (entity, telegram_msg_id) 的列表。
+        
+        错误处理：帖子被删除自动跳过，限流自动等待，不中断流程。
+        """
+        from telethon.errors import MsgIdInvalidError, FloodWaitError
+        
         total = 0
+        skipped = 0
+        errors = {}
+        
         for entity, post_msg_id, post_db_id in post_ids:
             try:
                 async for reply in self.client.iter_messages(entity, reply_to=post_msg_id):
@@ -268,10 +213,98 @@ class TelegramCollector:
                         continue
                     await self._store(reply, reply_text, message_type="comment", parent_message_id=post_db_id)
                     total += 1
+            except MsgIdInvalidError:
+                # 帖子已被删除，正常跳过
+                skipped += 1
+                logger.debug(f"   ⚠️ 帖子 {post_msg_id}: 已删除，跳过")
+            except FloodWaitError as e:
+                # 限流，等待后继续
+                errors['flood_wait'] = errors.get('flood_wait', 0) + 1
+                logger.warning(f"   ⏳ FloodWait {e.seconds}秒，等待后继续")
+                await asyncio.sleep(e.seconds)
             except Exception as e:
-                logger.error(f"Sync comments failed for post {post_msg_id}: {e}")
-        logger.info(f"🔄 Comments sync finished: {total} comments stored")
+                # 其他错误，分类记录
+                err_str = str(e).lower()
+                if 'forbidden' in err_str or 'privacy' in err_str:
+                    errors['forbidden'] = errors.get('forbidden', 0) + 1
+                elif 'timeout' in err_str:
+                    errors['timeout'] = errors.get('timeout', 0) + 1
+                else:
+                    errors['other'] = errors.get('other', 0) + 1
+                logger.debug(f"   ⚠️ 帖子 {post_msg_id}: {str(e)[:60]}")
+        
+        # 汇总日志
+        log_parts = [f"🔄 评论同步完成: 新增 {total} 条"]
+        if skipped:
+            log_parts.append(f"跳过已删除 {skipped} 个")
+        if errors:
+            error_detail = ", ".join(f"{k}: {v}" for k, v in errors.items())
+            log_parts.append(f"错误: {error_detail}")
+        logger.info("，".join(log_parts))
         return total
+
+    async def sync_posts_content(self, chat_id: int, batch_size: int = 100):
+        """同步所有帖子的最新内容：遍历数据库所有帖子，按 message_id 拉取最新文本，
+        检测是否有编辑（如综合评分变更）。
+        
+        注意：Telegram 频道没有"编辑事件"可订阅，只能通过主动拉取对比。
+        """
+        from telethon.errors import MsgIdInvalidError, FloodWaitError
+        
+        entity = await self.client.get_entity(chat_id)
+        
+        # 1. 从数据库获取该频道所有帖子的 message_id
+        all_posts = await self.db.get_all_posts(chat_id)
+        if not all_posts:
+            logger.info(f"  📭 chat_id={chat_id}: 无帖子，跳过内容同步")
+            return 0
+        
+        logger.info(f"  📥 chat_id={chat_id}: 共 {len(all_posts)} 个帖子，开始内容同步...")
+        
+        updated = 0
+        errors = 0
+        deleted = 0
+        
+        # 2. 分批拉取（Telethon get_messages 支持 ids 列表）
+        msg_ids = [p['message_id'] for p in all_posts if p.get('message_id')]
+        for i in range(0, len(msg_ids), batch_size):
+            batch = msg_ids[i:i + batch_size]
+            try:
+                messages = await self.client.get_messages(entity, ids=batch)
+                for m in messages:
+                    if m is None:
+                        deleted += 1  # 帖子已被删除
+                        continue
+                    text = m.text or ""
+                    if not text:
+                        continue
+                    await self.db.insert_message(
+                        chat_id=chat_id,
+                        message_id=m.id,
+                        user_id=str(m.sender_id) if m.sender_id else None,
+                        user_name=None,
+                        message_text=text,
+                        created_at=m.date,
+                        message_type="post",
+                    )
+                    updated += 1
+            except MsgIdInvalidError:
+                deleted += len(batch)
+            except FloodWaitError as e:
+                logger.warning(f"  ⏳ FloodWait: {e.seconds}秒，等待后继续")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                errors += len(batch)
+                logger.debug(f"  ⚠️ 批量拉取失败 ({i}-{i+len(batch)}): {str(e)[:80]}")
+            
+            if (i // batch_size + 1) % 5 == 0:
+                logger.info(f"  📊 已处理 {min(i + batch_size, len(msg_ids))}/{len(msg_ids)} 个帖子")
+            await asyncio.sleep(0.3)
+        
+        logger.info(
+            f"🔄 帖子内容同步完成: 更新 {updated} 个, 已删除 {deleted} 个, 错误 {errors} 个"
+        )
+        return updated
 
     async def send_message(self, chat_id, text: str):
         """发送消息（纯文本，避免 Markdown 解析失败）。"""

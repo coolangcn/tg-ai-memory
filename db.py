@@ -31,13 +31,37 @@ class Database:
             raise
 
     async def initialize_database(self):
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist (optimized schema)."""
         async with self.pool.acquire() as conn:
+            # 检查是否需要升级（旧表没有 message_type 列）
+            has_message_type = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'messages' AND column_name = 'message_type'
+                )
+            """)
+            
+            if not has_message_type:
+                print("🔄 检测到旧表结构，执行升级...")
+                # 旧表：添加缺失的列
+                await conn.execute("""
+                    ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_id BIGINT;
+                    ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_title TEXT;
+                    ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_message_id BIGINT;
+                    ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type TEXT DEFAULT 'post';
+                """)
+                # 为旧数据设置默认 message_type
+                await conn.execute("""
+                    UPDATE messages SET message_type = 'post' WHERE parent_message_id IS NULL AND message_type IS NULL;
+                    UPDATE messages SET message_type = 'comment' WHERE parent_message_id IS NOT NULL AND message_type IS NULL;
+                """)
+            
+            # 创建新表（如果不存在）
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id SERIAL PRIMARY KEY,
                     platform TEXT DEFAULT 'telegram',
-                    chat_id BIGINT,
+                    chat_id BIGINT NOT NULL,
                     message_id BIGINT,
                     chat_title TEXT,
                     user_id TEXT,
@@ -45,95 +69,52 @@ class Database:
                     message_text TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                     parent_message_id BIGINT,
-                    message_type TEXT DEFAULT 'post'
+                    message_type TEXT DEFAULT 'post' CHECK (message_type IN ('post', 'comment', 'other')),
+                    comment_calculated_score DOUBLE PRECISION DEFAULT 0
                 );
-                
+            """)
+            
+            # 确保列存在
+            await conn.execute("""
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_id BIGINT;
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_title TEXT;
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_message_id BIGINT;
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type TEXT DEFAULT 'post';
-                
-                CREATE TABLE IF NOT EXISTS media (
-                    id SERIAL PRIMARY KEY,
-                    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
-                    file_type TEXT NOT NULL,
-                    file_name TEXT,
-                    file_path TEXT NOT NULL,
-                    file_size BIGINT DEFAULT 0,
-                    mime_type TEXT,
-                    telegram_file_ref TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_messages_created_at 
-                ON messages(created_at DESC);
-                
-                CREATE INDEX IF NOT EXISTS idx_messages_chat_id 
-                ON messages(chat_id);
-                
-                CREATE INDEX IF NOT EXISTS idx_messages_parent 
-                ON messages(parent_message_id) WHERE parent_message_id IS NOT NULL;
-                
-                CREATE INDEX IF NOT EXISTS idx_media_message_id
-                ON media(message_id);
-                
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_msg_id 
-                ON messages(chat_id, message_id) WHERE message_id IS NOT NULL;
+                ALTER TABLE messages ADD COLUMN IF NOT EXISTS comment_calculated_score DOUBLE PRECISION DEFAULT 0;
             """)
-            logger.info("✅ Database tables initialized")
-
-    async def insert_media(
-        self,
-        message_id: int,
-        file_type: str,
-        file_path: str,
-        file_name: str = None,
-        file_size: int = 0,
-        mime_type: str = None,
-        telegram_file_ref: str = None,
-    ):
-        """Insert a media record linked to a message."""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO media (message_id, file_type, file_name, file_path, file_size, mime_type, telegram_file_ref)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT DO NOTHING
-            """, message_id, file_type, file_name, file_path, file_size, mime_type, telegram_file_ref)
-
-    async def get_media_by_message_id(self, message_id: int) -> List[Dict]:
-        """Get all media files for a message."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM media WHERE message_id = $1 ORDER BY id", message_id
-            )
-            return [dict(r) for r in rows]
-
-    async def get_messages_with_media(self, chat_id: int, limit: int = 50, offset: int = 0) -> List[Dict]:
-        """Get posts with their media and comment count."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT p.*, 
-                       COALESCE((
-                           SELECT json_agg(json_build_object(
-                               'id', m.id,
-                               'file_type', m.file_type,
-                               'file_path', m.file_path,
-                               'file_name', m.file_name,
-                               'file_size', m.file_size,
-                               'mime_type', m.mime_type
-                           ))
-                           FROM media m WHERE m.message_id = p.id
-                       ), '[]') AS media,
-                       (SELECT COUNT(*) FROM messages c WHERE c.parent_message_id = p.id AND c.message_type = 'comment') AS comment_count
-                FROM messages p
-                WHERE p.chat_id = $1 AND p.message_type = 'post'
-                ORDER BY p.created_at DESC
-                LIMIT $2 OFFSET $3
-            """, chat_id, limit, offset)
-            return [dict(r) for r in rows]
             
-            # Run initial cleanup
-            await self.cleanup_old_messages()
+            # 清理旧索引（如果存在，忽略错误）
+            await conn.execute("""
+                -- 帖子查询：按频道+类型+时间
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_type_created 
+                ON messages(chat_id, message_type, created_at DESC);
+                
+                -- 评论查询：按父消息 id
+                CREATE INDEX IF NOT EXISTS idx_messages_parent_type 
+                ON messages(parent_message_id, message_type) WHERE parent_message_id IS NOT NULL AND message_type = 'comment';
+                
+                -- 帖子唯一性
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_msg_id 
+                ON messages(chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'post';
+                
+                -- 评论唯一性（防止重复补抓）
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_comment_chat_msg_id 
+                ON messages(chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'comment';
+                
+                -- 评论按时间排序
+                CREATE INDEX IF NOT EXISTS idx_messages_comment_created 
+                ON messages(created_at DESC) WHERE message_type = 'comment';
+            """)
+            
+            # 清理旧索引（如果存在，忽略错误）
+            try:
+                await conn.execute("DROP INDEX IF EXISTS idx_messages_created_at")
+                await conn.execute("DROP INDEX IF EXISTS idx_messages_chat_id")
+                await conn.execute("DROP INDEX IF EXISTS idx_messages_parent")
+            except Exception:
+                pass
+            
+            logger.info("✅ Database tables initialized (optimized schema)")
 
     async def cleanup_old_messages(self):
         """Delete messages older than 14 days."""
@@ -160,22 +141,32 @@ class Database:
         message_type: str = "post",
     ):
         """Insert a new message into the database (dedup by chat_id + message_id).
+        帖子：冲突时更新文本。评论：冲突时跳过（DO NOTHING）。
         Returns the db id of the message (existing or newly inserted), or None.
         """
         if created_at is None:
             created_at = datetime.now(timezone.utc)
         async with self.pool.acquire() as conn:
-            # Try to insert and return id
-            row = await conn.fetchrow("""
-                INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL
-                DO UPDATE SET message_text = EXCLUDED.message_text
-                RETURNING id
-            """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+            if message_type == "comment":
+                # 评论：重复则跳过
+                row = await conn.fetchrow("""
+                    INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'comment'
+                    DO NOTHING
+                    RETURNING id
+                """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+            else:
+                # 帖子：冲突时更新文本
+                row = await conn.fetchrow("""
+                    INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'post'
+                    DO UPDATE SET message_text = EXCLUDED.message_text
+                    RETURNING id
+                """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
             if row:
                 return row["id"]
-            # Fallback: message without message_id, just inserted
             return None
 
     async def get_messages_last_24h(self, chat_id: int) -> List[Dict]:
@@ -343,6 +334,106 @@ class Database:
                 chat_id
             )
             return result
+
+    async def get_posts_without_comments(self, chat_id: int, limit: int = 100) -> List[Dict]:
+        """获取缺少评论的帖子（用于补抓评论）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT p.id, p.message_id, p.message_text, p.created_at
+                FROM messages p
+                LEFT JOIN messages c ON c.parent_message_id = p.id AND c.message_type = 'comment'
+                WHERE p.chat_id = $1 AND p.message_type = 'post'
+                  AND p.message_id IS NOT NULL
+                  AND c.id IS NULL
+                ORDER BY p.created_at DESC
+                LIMIT $2
+            """, chat_id, limit)
+            return [dict(r) for r in rows]
+
+    async def get_all_posts(self, chat_id: int) -> List[Dict]:
+        """获取频道所有帖子（用于全量评论对账）。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, message_id, message_text, created_at
+                FROM messages
+                WHERE chat_id = $1 AND message_type = 'post'
+                  AND message_id IS NOT NULL
+                ORDER BY created_at DESC
+            """, chat_id)
+            return [dict(r) for r in rows]
+
+    async def get_comment_count(self, chat_id: int) -> int:
+        """获取频道评论总数。"""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND message_type = 'comment'", chat_id
+            ) or 0
+
+    async def get_distinct_chat_ids(self) -> list:
+        """获取所有有帖子的频道 ID 列表。"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT chat_id FROM messages WHERE message_type = 'post' ORDER BY chat_id"
+            )
+            return [r["chat_id"] for r in rows]
+
+    async def update_post_score(self, db_id: int, new_score: float):
+        """更新帖子的综合评分。"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE messages SET comment_calculated_score = $1 WHERE id = $2",
+                new_score, db_id
+            )
+
+    async def calculate_comment_score(self, db_id: int) -> float:
+        """根据评论计算平均评分。"""
+        async with self.pool.acquire() as conn:
+            # 获取所有有效评分的评论
+            rows = await conn.fetch("""
+                SELECT message_text FROM messages 
+                WHERE parent_message_id = $1 AND message_type = 'comment'
+            """, db_id)
+            
+            scores = []
+            import re
+            for row in rows:
+                text = row['message_text'] or ''
+                # 匹配 "整场综合评分: X.X" 格式
+                m = re.search(r'整场综合评分[：:]\s*(\d+\.?\d*)', text)
+                if m:
+                    score = float(m.group(1))
+                    if score > 0:
+                        scores.append(score)
+            
+            if scores:
+                return sum(scores) / len(scores)
+            return 0
+
+    async def update_all_comment_scores(self, chat_id: int) -> Dict[str, int]:
+        """更新频道所有帖子的评论计算评分。"""
+        import re
+        stats = {"updated": 0, "no_comments": 0}
+        
+        async with self.pool.acquire() as conn:
+            # 获取所有有评论的帖子
+            rows = await conn.fetch("""
+                SELECT DISTINCT p.id 
+                FROM messages p
+                INNER JOIN messages c ON c.parent_message_id = p.id AND c.message_type = 'comment'
+                WHERE p.chat_id = $1 AND p.message_type = 'post'
+            """, chat_id)
+            
+            for row in rows:
+                db_id = row['id']
+                # 计算该帖子的评论均分
+                score = await self.calculate_comment_score(db_id)
+                if score > 0:
+                    await self.update_post_score(db_id, score)
+                    stats["updated"] += 1
+                else:
+                    stats["no_comments"] += 1
+        
+        return stats
 
     async def close(self):
         """Close database connection pool."""
