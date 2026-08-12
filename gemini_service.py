@@ -14,7 +14,7 @@ class GeminiService:
     def __init__(self, api_key: str, base_url: str = "", model: str = ""):
         self.api_key = api_key
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.moco.fun/v1")
-        self.model = model or os.getenv("OPENAI_MODEL", "gemini-3.5-flash-lite")
+        self.model = model or os.getenv("OPENAI_MODEL", "gemini-3.5-flash")
         self.client = AsyncOpenAI(api_key=api_key, base_url=self.base_url)
 
     async def _chat(self, prompt: str, max_tokens: int = 4000) -> str:

@@ -4,6 +4,7 @@ Handles PostgreSQL connection, table initialization, and data operations.
 """
 import asyncpg
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
@@ -70,7 +71,8 @@ class Database:
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                     parent_message_id BIGINT,
                     message_type TEXT DEFAULT 'post' CHECK (message_type IN ('post', 'comment', 'other')),
-                    comment_calculated_score DOUBLE PRECISION DEFAULT 0
+                    comment_calculated_score DOUBLE PRECISION DEFAULT 0,
+                    teacher_name TEXT
                 );
             """)
             
@@ -81,7 +83,17 @@ class Database:
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_message_id BIGINT;
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type TEXT DEFAULT 'post';
                 ALTER TABLE messages ADD COLUMN IF NOT EXISTS comment_calculated_score DOUBLE PRECISION DEFAULT 0;
+                ALTER TABLE messages ADD COLUMN IF NOT EXISTS teacher_name TEXT;
             """)
+            
+            # 回填历史帖子的老师名称（只处理尚未回填的帖子）
+            backfilled = await conn.fetchval(r"""
+                UPDATE messages
+                SET teacher_name = SUBSTRING(message_text FROM '👧#(\w+)')
+                WHERE message_type = 'post' AND teacher_name IS NULL AND message_text IS NOT NULL
+            """)
+            if backfilled:
+                logger.info(f"🔄 回填老师名称字段: {backfilled} 条帖子")
             
             # 清理旧索引（如果存在，忽略错误）
             await conn.execute("""
@@ -139,6 +151,7 @@ class Database:
         created_at: datetime = None,
         parent_message_id: int = None,
         message_type: str = "post",
+        teacher_name: str = None,
     ):
         """Insert a new message into the database (dedup by chat_id + message_id).
         帖子：冲突时更新文本。评论：冲突时跳过（DO NOTHING）。
@@ -146,6 +159,10 @@ class Database:
         """
         if created_at is None:
             created_at = datetime.now(timezone.utc)
+        # 帖子自动提取老师名称（👧#名字）
+        if message_type == "post" and not teacher_name and message_text:
+            m = re.search(r'👧#(\w+)', message_text)
+            teacher_name = m.group(1) if m else None
         async with self.pool.acquire() as conn:
             if message_type == "comment":
                 # 评论：重复则跳过
@@ -157,14 +174,14 @@ class Database:
                     RETURNING id
                 """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
             else:
-                # 帖子：冲突时更新文本
+                # 帖子：冲突时更新文本（含老师名称）
                 row = await conn.fetchrow("""
-                    INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type, teacher_name)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'post'
-                    DO UPDATE SET message_text = EXCLUDED.message_text
+                    DO UPDATE SET message_text = EXCLUDED.message_text, teacher_name = COALESCE(EXCLUDED.teacher_name, messages.teacher_name)
                     RETURNING id
-                """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+                """, chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type, teacher_name)
             if row:
                 return row["id"]
             return None
