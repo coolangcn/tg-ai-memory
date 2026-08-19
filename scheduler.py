@@ -1,5 +1,6 @@
 """
-调度器：高分榜单报告 + 每日精华总结 + 数据库清理 + 全量评论补抓。
+调度器：高分榜单报告 + 每日精华总结 + 全量评论补抓。
+（已移除数据库清理任务：数据只增不减，保留全部历史帖子与评论。）
 """
 import asyncio
 import logging
@@ -29,14 +30,14 @@ class BotScheduler:
         self.gemini = gemini
         self.summary_chat_id = summary_chat_id
 
-    async def cleanup_task(self):
-        """定时清理 14 天前的旧消息。"""
-        logger.info("⏰ Running scheduled cleanup task...")
+    async def discussion_report_sync_task(self):
+        """定时增量拉取讨论组报告模板，按老师名关联到频道帖子入库。"""
+        logger.info("⏰ Running discussion report sync task...")
         try:
-            deleted_count = await self.db.cleanup_old_messages()
-            logger.info(f"✅ Cleanup completed: {deleted_count} messages deleted")
+            matched = await self.collector.sync_discussion_reports(limit=500)
+            logger.info(f"✅ Discussion report sync completed: {matched} 条报告评论关联入库")
         except Exception as e:
-            logger.error(f"❌ Cleanup task failed: {e}")
+            logger.error(f"❌ Discussion report sync task failed: {e}")
 
     async def daily_ranking_task(self):
         """定时生成并发送高分老师榜单报告（图文并茂）。"""
@@ -44,6 +45,9 @@ class BotScheduler:
         try:
             # 先补采评论（报告），确保榜单数据是最新的
             await sync_today_comments(self.collector, self.db)
+
+            # 补采讨论组报告模板（按老师名关联到帖子）
+            await self.collector.sync_discussion_reports(limit=500)
 
             from send_report import generate_and_send
             report = await generate_and_send(self.db, self.collector, self.gemini)
@@ -63,6 +67,9 @@ class BotScheduler:
 
             # 1.5 补采今日帖子的评论
             await sync_today_comments(self.collector, self.db)
+
+            # 1.6 补采讨论组报告模板（按老师名关联到帖子）
+            await self.collector.sync_discussion_reports(limit=500)
 
             # 2. 汇总今日所有目标来源的帖子+评论
             today = datetime.now().date()
@@ -148,178 +155,16 @@ class BotScheduler:
             logger.error(f"❌ Full post sync task failed: {e}")
 
     async def daily_comment_backfill_task(self):
-        """每日全量评论补抓：对所有帖子拉取评论，补全缺失部分。
-        
-        策略：遍历所有帖子，逐个拉取全部评论。
-        已存在的评论会因唯一索引冲突自动跳过（ON CONFLICT DO NOTHING），
-        确保不重复入库，同时补全缺失的评论。
+        """每日全量评论补抓（v2）：对每个帖子调用 GetDiscussionMessageRequest
+        定位讨论群「镜像帖」，再用 iter_messages(reply_to=镜像帖ID) 抓取评论，
+        以帖子 DB id 关联入库。
+        幂等：评论按 (chat_id, message_id) 唯一去重，DO UPDATE 纠正父帖关联。
+        只处理最近 200 个帖子（每日增量），历史全量由启动时完成。
         """
-        from telethon.errors import MsgIdInvalidError, FloodWaitError
-        from datetime import timezone
-        
-        logger.info("⏰ Running daily comment backfill task (full reconciliation)...")
+        logger.info("⏰ Running daily comment backfill task (v2, recent 200 posts)...")
         try:
-            total_new_comments = 0
-            total_skipped = 0  # 已存在被跳过的评论数
-            total_posts_processed = 0
-            total_posts_with_new = 0
-            total_errors = 0
-            
-            # 失败原因分类统计
-            failure_reasons = {
-                'msg_id_invalid': 0,   # 消息已删除/不存在
-                'flood_wait': 0,       # 请求过于频繁
-                'forbidden': 0,        # 无权限访问
-                'timeout': 0,          # 超时
-                'other': 0,            # 其他错误
-            }
-            
-            # 获取频道 ID 列表（优先 watched_chat_ids，否则从数据库获取）
-            chat_ids = list(self.collector.watched_chat_ids)
-            if not chat_ids:
-                # 从数据库获取有帖子的频道
-                chat_ids = await self.db.get_distinct_chat_ids()
-                logger.info(f"  📋 从数据库获取到 {len(chat_ids)} 个有帖子的频道")
-            
-            if not chat_ids:
-                logger.info("⚠️ 无可用频道，跳过评论补抓")
-                return
-            
-            for chat_id in chat_ids:
-                # 获取该频道所有帖子
-                all_posts = await self.db.get_all_posts(chat_id)
-                if not all_posts:
-                    logger.info(f"  ✅ chat_id={chat_id}: 无帖子，跳过")
-                    continue
-                
-                logger.info(f"  📥 chat_id={chat_id}: {len(all_posts)} 个帖子，开始全量对账...")
-                
-                # 获取频道实体
-                try:
-                    entity = await self.collector.client.get_entity(chat_id)
-                except Exception as e:
-                    logger.error(f"  ❌ 无法获取频道实体 {chat_id}: {e}")
-                    continue
-                
-                for post in all_posts:
-                    post_db_id = post['id']
-                    post_msg_id = post['message_id']
-                    
-                    if not post_msg_id:
-                        continue
-                    
-                    try:
-                        # 拉取该帖子的全部评论，逐个插入（重复自动跳过）
-                        new_count = 0
-                        skip_count = 0
-                        async for reply in self.collector.client.iter_messages(entity, reply_to=post_msg_id):
-                            reply_text = reply.text or ""
-                            if not reply_text:
-                                continue
-                            
-                            # 评论者信息
-                            reply_user_name = None
-                            reply_user_id = None
-                            try:
-                                sender = await reply.get_sender()
-                                if sender is not None:
-                                    reply_user_id = str(sender.id)
-                                    from telethon.tl.types import User
-                                    if isinstance(sender, User):
-                                        reply_user_name = sender.username or sender.first_name or f"User{sender.id}"
-                            except Exception:
-                                pass
-                            
-                            reply_created = reply.date
-                            if reply_created and reply_created.tzinfo is None:
-                                reply_created = reply_created.replace(tzinfo=timezone.utc)
-                            
-                            # 插入评论（已存在则跳过）
-                            result = await self.db.insert_message(
-                                chat_id=chat_id,
-                                message_id=reply.id,
-                                user_id=reply_user_id,
-                                user_name=reply_user_name,
-                                message_text=reply_text,
-                                created_at=reply_created,
-                                parent_message_id=post_db_id,
-                                message_type="comment",
-                            )
-                            if result:
-                                new_count += 1
-                            else:
-                                skip_count += 1
-                        
-                        total_posts_processed += 1
-                        total_new_comments += new_count
-                        total_skipped += skip_count
-                        
-                        if new_count > 0:
-                            total_posts_with_new += 1
-                        
-                        if total_posts_processed % 20 == 0:
-                            logger.info(
-                                f"  📊 已处理 {total_posts_processed}/{len(all_posts)} 个帖子, "
-                                f"新增 {total_new_comments} 条, 跳过 {total_skipped} 条"
-                            )
-                        
-                        await asyncio.sleep(0.3)
-                        
-                    except MsgIdInvalidError:
-                        # 帖子已被删除，正常跳过，不中断流程
-                        total_posts_processed += 1
-                        failure_reasons['msg_id_invalid'] += 1
-                        logger.debug(f"  ⚠️ 帖子 {post_msg_id}: 已删除，自动跳过")
-                        continue  # 明确跳过，继续下一个
-                    except FloodWaitError as e:
-                        # Telegram 限流，等待后继续处理当前帖子
-                        failure_reasons['flood_wait'] += 1
-                        logger.warning(f"  ⏳ FloodWait: {e.seconds}秒，等待后继续")
-                        await asyncio.sleep(e.seconds)
-                        # 重试当前帖子
-                        try:
-                            async for reply in self.collector.client.iter_messages(entity, reply_to=post_msg_id):
-                                reply_text = reply.text or ""
-                                if not reply_text:
-                                    continue
-                                # ... 重新处理（简化：直接跳过，下次定时任务会补）
-                        except Exception:
-                            pass
-                        continue
-                    except Exception as e:
-                        total_errors += 1
-                        total_posts_processed += 1
-                        # 分类错误原因
-                        err_str = str(e).lower()
-                        if 'forbidden' in err_str or 'not authorized' in err_str or 'privacy' in err_str:
-                            failure_reasons['forbidden'] += 1
-                            logger.debug(f"  ⚠️ 帖子 {post_msg_id}: 无权限，跳过")
-                        elif 'timeout' in err_str or 'timed out' in err_str:
-                            failure_reasons['timeout'] += 1
-                            logger.debug(f"  ⚠️ 帖子 {post_msg_id}: 超时，跳过")
-                        else:
-                            failure_reasons['other'] += 1
-                            if total_errors <= 10:
-                                logger.warning(f"  ⚠️ 帖子 {post_msg_id}: {str(e)[:80]}")
-                        await asyncio.sleep(1)
-                        continue  # 明确跳过
-                
-                logger.info(f"  ✅ chat_id={chat_id}: 处理完成")
-            
-            logger.info(
-                f"✅ Comment backfill completed:\n"
-                f"  📊 处理 {total_posts_processed} 个帖子, "
-                f"有新增的帖子 {total_posts_with_new} 个\n"
-                f"  💬 新增评论 {total_new_comments} 条, "
-                f"跳过已有 {total_skipped} 条\n"
-                f"  ❌ 失败 {total_errors} 条:\n"
-                f"     - 消息已删除/不存在: {failure_reasons['msg_id_invalid']}\n"
-                f"     - 请求频繁(FloodWait): {failure_reasons['flood_wait']}\n"
-                f"     - 无权限访问: {failure_reasons['forbidden']}\n"
-                f"     - 超时: {failure_reasons['timeout']}\n"
-                f"     - 其他错误: {failure_reasons['other']}"
-            )
-            
+            matched = await self.collector.sync_all_comments(limit=200)
+            logger.info(f"✅ Comment backfill completed: {matched} 条评论入库/更新")
         except Exception as e:
             logger.error(f"❌ Daily comment backfill task failed: {e}")
 
@@ -350,16 +195,17 @@ class BotScheduler:
         )
         logger.info("📅 Scheduled: Ranking report at 09:00 (server local time)")
 
+        # 讨论组报告同步（每小时一次，确保榜单/每日总结前数据最新）
         self.scheduler.add_job(
-            self.cleanup_task,
-            CronTrigger(hour=0, minute=30),
-            id='daily_cleanup',
-            name='Database Cleanup',
+            self.discussion_report_sync_task,
+            CronTrigger(minute=10),
+            id='discussion_report_sync',
+            name='Discussion Report Sync',
             replace_existing=True
         )
-        logger.info("📅 Scheduled: Database cleanup at 00:30")
+        logger.info("📅 Scheduled: Discussion report sync every hour")
 
-        # 全量帖子同步（每天 01:30，在清理之后、评论补抓之前）
+        # 全量帖子同步（每天 01:30，在评论补抓之前）
         self.scheduler.add_job(
             self.daily_full_post_sync_task,
             CronTrigger(hour=1, minute=30),

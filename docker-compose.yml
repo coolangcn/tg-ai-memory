@@ -26,6 +26,7 @@ services:
       - OPENAI_MODEL=gemini-3.5-flash
       # 采集配置
       - WATCH_CHANNELS=@SZnewls
+      - DISCUSSION_CHAT_ID=-1003367541028
       - SUMMARY_CHAT_ID=me
       - REPORT_TIME=23:59
       - MEDIA_DIR=/app/media

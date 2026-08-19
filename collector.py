@@ -9,6 +9,7 @@ Telethon collector - 用用户账号采集 Telegram 频道/群组消息。
 import asyncio
 import logging
 import os
+import re
 from datetime import timezone
 
 from telethon import TelegramClient, events
@@ -20,6 +21,32 @@ from gemini_service import GeminiService
 logger = logging.getLogger(__name__)
 
 SESSION_NAME = "telegram"
+
+# 讨论组 chat_id：频道帖子（👧#老师名）通过老师名关联讨论组里的「报告模板」评价
+DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID", "-1003367541028"))
+
+
+def extract_teacher_from_report(text: str):
+    """从讨论组报告提取老师名字。"""
+    if not text:
+        return None
+    m = re.search(r'老师[：:]\s*#?(\w+)', text)
+    return m.group(1) if m else None
+
+
+def extract_teacher_from_post(text: str):
+    """从频道帖子提取老师名字。"""
+    if not text:
+        return None
+    m = re.search(r'👧#(\w+)', text)
+    return m.group(1) if m else None
+
+
+def is_report(text: str) -> bool:
+    """判断是否是报告模板消息。"""
+    if not text:
+        return False
+    return ('报告模板' in text) or ('整场综合评分' in text) or ('老师：' in text or '老师:' in text)
 
 # SPA 广告过滤关键词
 SPA_KEYWORDS = [
@@ -69,6 +96,8 @@ class TelegramCollector:
         self.watched_entities = []
         self.watched_chat_ids = set()
         self.source_names = []
+        self.discussion_chat_id = int(os.getenv("DISCUSSION_CHAT_ID", "-1003367541028"))
+        self.discussion_entity = None
 
     async def start(self):
         """启动客户端、解析采集目标、注册实时监听。"""
@@ -90,12 +119,23 @@ class TelegramCollector:
         if not self.watched_entities:
             raise RuntimeError("No watchable entities - check WATCH_CHANNELS and account access")
 
-        # 注册实时消息监听
+        # 注册实时消息监听（频道）
         self.client.add_event_handler(
             self._on_new_message,
             events.NewMessage(chats=self.watched_entities)
         )
         logger.info("👂 Real-time listener registered")
+
+        # 注册讨论组监听：报告模板消息按老师名关联到频道帖子，作为评论入库
+        try:
+            self.discussion_entity = await self.client.get_input_entity(self.discussion_chat_id)
+            self.client.add_event_handler(
+                self._on_new_message,
+                events.NewMessage(chats=[self.discussion_entity])
+            )
+            logger.info(f"👂 Discussion group listener registered: {self.discussion_chat_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Cannot access discussion group {self.discussion_chat_id}: {e}")
 
     async def _entity_title(self, name: str) -> str:
         try:
@@ -105,13 +145,30 @@ class TelegramCollector:
             return name
 
     async def _on_new_message(self, event):
-        """实时收到的新消息 -> 入库。"""
+        """实时收到的新消息 -> 入库。讨论组报告按老师名关联到频道帖子。"""
         try:
             msg = event.message
             text = msg.text or ""
             if not text:
                 return
-            # 判断是否是评论（回复某条帖子）
+
+            # 讨论组消息：报告模板 -> 关联频道帖子作为评论入库；其他消息忽略
+            if msg.chat_id == self.discussion_chat_id:
+                if not is_report(text):
+                    return
+                teacher = extract_teacher_from_report(text)
+                if not teacher:
+                    logger.debug(f"讨论组报告无老师名，跳过 msg={msg.id}")
+                    return
+                post_db_id = await self._find_post_db_id_by_teacher(teacher)
+                if not post_db_id:
+                    logger.debug(f"讨论组报告未匹配到频道帖子: 老师={teacher}, msg={msg.id}")
+                    return
+                await self._store(msg, text, message_type="comment", parent_message_id=post_db_id)
+                logger.info(f"✅ 讨论组报告入库: 老师={teacher}, msg={msg.id}")
+                return
+
+            # 频道消息：判断是否是评论（回复某条帖子）
             parent_id = None
             msg_type = "post"
             if msg.reply_to and msg.reply_to.reply_to_msg_id:
@@ -120,6 +177,197 @@ class TelegramCollector:
             await self._store(msg, text, message_type=msg_type, parent_message_id=parent_id)
         except Exception as e:
             logger.error(f"Error handling new message: {e}")
+
+    async def _find_post_db_id_by_teacher(self, teacher: str):
+        """按老师名查找最新频道帖子的 db id。"""
+        if not teacher:
+            return None
+        async with self.db.pool.acquire() as conn:
+            return await conn.fetchval("""
+                SELECT id FROM messages
+                WHERE message_type = 'post' AND teacher_name = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, teacher)
+
+    async def sync_discussion_reports(self, limit: int = 500):
+        """增量拉取讨论组最近的报告模板消息，按老师名关联到频道帖子入库。
+        幂等：重复执行不会产生重复评论；已有关联会被纠正（DO UPDATE parent_message_id）。
+        返回: 本次匹配入库的报告评论数。
+        """
+        if self.discussion_entity is None:
+            try:
+                self.discussion_entity = await self.client.get_entity(self.discussion_chat_id)
+            except Exception as e:
+                logger.error(f"❌ 无法访问讨论组 {self.discussion_chat_id}: {e}")
+                return 0
+
+        # 构建 老师名 -> 帖子 db id 映射（同名字保留最新帖）
+        async with self.db.pool.acquire() as conn:
+            post_rows = await conn.fetch("""
+                SELECT id, teacher_name FROM messages
+                WHERE message_type = 'post' AND teacher_name IS NOT NULL
+                ORDER BY created_at DESC
+            """)
+        name_to_post = {}
+        for r in post_rows:
+            if r['teacher_name'] not in name_to_post:
+                name_to_post[r['teacher_name']] = r['id']
+
+        matched = 0
+        scanned = 0
+        async for m in self.client.iter_messages(self.discussion_entity, limit=limit):
+            scanned += 1
+            text = m.text or ""
+            if not text or not is_report(text):
+                continue
+            teacher = extract_teacher_from_report(text)
+            if not teacher:
+                continue
+            post_db_id = name_to_post.get(teacher)
+            if not post_db_id:
+                continue
+
+            created_at = m.date
+            if created_at is not None and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+
+            async with self.db.pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'comment')
+                    ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL
+                    DO UPDATE SET parent_message_id = EXCLUDED.parent_message_id
+                """, m.chat_id, m.id, "讨论组", str(m.sender_id), teacher, text, created_at, post_db_id)
+            matched += 1
+
+        logger.info(f"🔄 讨论组报告同步: 扫描 {scanned} 条消息, 关联入库 {matched} 条报告评论")
+        return matched
+
+    async def cleanup_all_comments(self):
+        """清理 v1 污染数据：删除全部评论记录，由 v2 全量重建。
+        旧版 sync_all_comments（v1）把讨论群 2084 条自发消息误当成评论入库，
+        且把评论的父帖关联（parent_message_id）批量改错，
+        无法用简单条件区分真假，因此整体清空评论表由 v2 重建最安全。
+        返回: 删除条数。
+        """
+        async with self.db.pool.acquire() as conn:
+            deleted = await conn.execute("DELETE FROM messages WHERE message_type = 'comment'")
+        count = deleted.split()[-1]
+        logger.info(f"🧹 评论表已清空: 删除 {count} 条（等待 v2 全量重建）")
+        return int(count)
+
+    async def sync_all_comments(self, limit: int = None):
+        """全量补采评论（v2 正确版，核心修复）。
+
+        关键认知：Telegram 频道帖子的评论实际存储在关联讨论群中，且讨论群
+        「镜像帖」的 message_id 与频道帖子 ID 是两套独立编号体系，
+        不能用讨论群消息的 reply_to 去频道反查帖子。
+
+        正确抓取路径（已用帖子 17988 实测验证，35 条与端上完全一致）：
+          1. GetDiscussionMessageRequest(peer=频道, msg_id=帖子ID) 取讨论消息；
+          2. 在返回消息中找镜像帖：m.replies.replies > 0 且 date 最早的一条；
+          3. iter_messages(讨论群, reply_to=镜像帖ID) 抓取该帖子全部评论；
+          4. 评论以帖子 DB id 作为 parent_message_id 入库。
+
+        幂等：评论按 (chat_id, message_id) 唯一去重，DO UPDATE 纠正父帖关联。
+        limit: 只处理最近的 N 个帖子（None 表示全部）。
+        返回: 本次入库/更新的评论数。
+        """
+        from telethon.tl.functions.messages import GetDiscussionMessageRequest
+        from telethon.errors import FloodWaitError, MsgIdInvalidError
+
+        if self.discussion_entity is None:
+            try:
+                self.discussion_entity = await self.client.get_entity(self.discussion_chat_id)
+            except Exception as e:
+                logger.error(f"❌ 无法访问讨论组 {self.discussion_chat_id}: {e}")
+                return 0
+
+        # DB 帖子 -> 待处理列表（含所属频道 chat_id）
+        async with self.db.pool.acquire() as conn:
+            post_rows = await conn.fetch("""
+                SELECT id, message_id, chat_id FROM messages
+                WHERE message_type = 'post' AND message_id IS NOT NULL
+                ORDER BY created_at DESC
+            """)
+        if limit:
+            post_rows = post_rows[:limit]
+        logger.info(f"🔄 评论全量同步(v2): 待处理帖子 {len(post_rows)} 个")
+
+        chat_entities = {}
+        async def _get_chat_entity(chat_id):
+            if chat_id not in chat_entities:
+                chat_entities[chat_id] = await self.client.get_entity(chat_id)
+            return chat_entities[chat_id]
+
+        matched = 0
+        no_discussion = 0
+        errors = 0
+        for i, r in enumerate(post_rows, 1):
+            post_db_id, post_msg_id, post_chat_id = r['id'], r['message_id'], r['chat_id']
+            try:
+                channel_entity = await _get_chat_entity(post_chat_id)
+                res = await self.client(GetDiscussionMessageRequest(
+                    peer=channel_entity,
+                    msg_id=post_msg_id,
+                ))
+            except MsgIdInvalidError:
+                no_discussion += 1  # 帖子无讨论/已被删除
+                continue
+            except FloodWaitError as e:
+                logger.warning(f"  ⏳ GetDiscussionMessage FloodWait {e.seconds}秒，等待后继续")
+                await asyncio.sleep(e.seconds)
+                continue
+            except Exception as e:
+                errors += 1
+                logger.debug(f"  ⚠️ 获取讨论失败 post={post_msg_id}: {str(e)[:60]}")
+                continue
+
+            # 找镜像帖：replies > 0 且 date 最早（首条是频道媒体投递链，须跳过）
+            mirror = None
+            for m in res.messages:
+                rp = getattr(m, "replies", None)
+                if rp and getattr(rp, "replies", 0) > 0:
+                    if mirror is None or (m.date and (mirror.date is None or m.date < mirror.date)):
+                        mirror = m
+            if mirror is None:
+                no_discussion += 1
+                continue
+
+            # 抓镜像帖的评论
+            try:
+                async for cm in self.client.iter_messages(self.discussion_entity, reply_to=mirror.id):
+                    text = cm.text or ""
+                    if not text:
+                        continue
+                    created_at = cm.date
+                    if created_at is not None and created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    async with self.db.pool.acquire() as conn:
+                        await conn.execute("""
+                            INSERT INTO messages (chat_id, message_id, chat_title, user_id, user_name, message_text, created_at, parent_message_id, message_type)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'comment')
+                            ON CONFLICT (chat_id, message_id) WHERE message_id IS NOT NULL AND message_type = 'comment'
+                            DO UPDATE SET parent_message_id = EXCLUDED.parent_message_id
+                        """, cm.chat_id, cm.id, "讨论组",
+                            str(cm.sender_id) if cm.sender_id else None,
+                            None, text, created_at, post_db_id)
+                    matched += 1
+            except FloodWaitError as e:
+                logger.warning(f"  ⏳ 评论抓取 FloodWait {e.seconds}秒，等待后继续")
+                await asyncio.sleep(e.seconds)
+            except MsgIdInvalidError:
+                no_discussion += 1
+            except Exception as e:
+                errors += 1
+                logger.debug(f"  ⚠️ 评论抓取失败 post={post_msg_id}: {str(e)[:60]}")
+
+            if i % 100 == 0:
+                logger.info(f"  📦 v2 评论同步进度: {i}/{len(post_rows)} 帖子, 已入库 {matched} 条评论")
+
+        logger.info(f"🔄 评论全量同步(v2)完成: 处理帖子 {len(post_rows)} 个, 入库 {matched} 条评论, 无讨论 {no_discussion}, 错误 {errors}")
+        return matched
 
     async def _store(self, msg, text: str, message_type: str = "post", parent_message_id: int = None):
         """把一条消息写入数据库（按 chat_id + message_id 去重），并保存媒体引用。

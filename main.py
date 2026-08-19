@@ -58,7 +58,20 @@ async def run_collector():
     # 启动时补采
     logger.info("🔄 Syncing recent posts...")
     await collector.sync_recent(limit=500)
+
+    # 全量补帖子（only_with_score 只保留含综合评分的老师帖，
+    # 确保 DB 帖子覆盖端上全部 5262 条，评论才能全部挂载）
+    logger.info("🔄 Full syncing posts...")
+    await collector.full_sync_posts(only_with_score=True)
     await sync_today_comments(collector, db)
+
+    # 启动时补采讨论组报告（覆盖离线期间遗漏的评价）
+    logger.info("🔄 Syncing discussion reports...")
+    await collector.sync_discussion_reports(limit=500)
+
+    # 启动时全量补采评论（v2：GetDiscussionMessageRequest 定位镜像帖后抓取，幂等纠偏关联）
+    logger.info("🔄 Syncing all discussion comments (v2)...")
+    await collector.sync_all_comments()
 
     # 调度器（高分榜单 09:00 + 每日精华 23:59 + 清理 00:30）
     logger.info(f"⏰ Daily teacher report at {report_time}")
@@ -67,9 +80,27 @@ async def run_collector():
 
     logger.info("✅ Collector is running...")
 
-    # 保持运行
+    # 保持运行 + Telegram 断线自动重连看门狗
+    # Telethon 断线后不会自动恢复，需定期检查并重连，否则定时任务会报
+    # "Cannot send requests while disconnected"。
+    logger.info("🛡️ Connection watchdog started (check every 60s)")
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(60)
+        try:
+            if collector.client.is_connected():
+                continue
+            logger.warning("⚠️ Telegram 连接断开，尝试重连...")
+            await collector.client.connect()
+            if not collector.client.is_connected():
+                logger.error("❌ Telegram 重连失败，60s 后重试")
+                continue
+            authorized = await collector.client.is_user_authorized()
+            if authorized:
+                logger.info("✅ Telegram 重连成功")
+            else:
+                logger.error("❌ 已重连但会话失效，请重新运行 login.py")
+        except Exception as e:
+            logger.error(f"❌ 连接检查/重连异常: {e}")
 
 
 async def main():
